@@ -18,139 +18,79 @@ import (
 	"time"
 )
 
+const (
+	areaSize   = 100000
+	shardCount = 64
+	bufferSize = 128
+	loadWeight = 10000
+
+	orderMinBatch = 1
+	orderMaxBatch = 50
+	orderMinWait  = 10 * time.Millisecond
+	orderMaxWait  = 50 * time.Millisecond
+
+	riderMinWait = 100 * time.Millisecond
+	riderMaxWait = 500 * time.Millisecond
+
+	statsInterval = time.Second
+)
+
 func main() {
-	riderCount := flag.Int("riders", 100, "number of riders")
-	orderCount := flag.Int("orders", 10000, "number of orders")
-	batchSize := flag.Int("batch", 1000, "orders generated per batch")
-	workerCount := flag.Int("workers", 2, "matcher worker count")
-	shardCount := flag.Int("shards", 64, "spatial shard count")
-	areaSize := flag.Int("area", 100000, "coordinate range: [0, area)")
-	cellSize := flag.Int("cell", 0, "grid cell size; 0 means auto")
-	bufferSize := flag.Int("buffer", 128, "channel buffer size for batches")
-	loadWeight := flag.Int64("load-weight", 10000, "assigned-order penalty in score")
-	durationText := flag.String("duration", "0s", "input duration, such as 30s or 1m; 0s means burst mode")
-	continuous := flag.Bool("continuous", false, "keep generating random orders until Ctrl+C or -run-for expires")
-	runForText := flag.String("run-for", "0s", "continuous mode runtime; 0s means until Ctrl+C")
-	minBatchSize := flag.Int("min-batch", 1, "continuous mode minimum batch size")
-	maxBatchSize := flag.Int("max-batch", 0, "continuous mode maximum batch size; 0 means -batch")
-	minIntervalText := flag.String("min-interval", "10ms", "continuous mode minimum wait between batches")
-	maxIntervalText := flag.String("max-interval", "100ms", "continuous mode maximum wait between batches")
-	statsIntervalText := flag.String("stats-interval", "1s", "continuous mode stats print interval")
+	riderCount := flag.Int("riders", 100, "initial rider count")
+	workerCount := flag.Int("workers", 2, "worker count")
+	runForText := flag.String("run-for", "0s", "runtime; 0s means until Ctrl+C")
 	seed := flag.Int64("seed", 1, "random seed")
 	flag.Parse()
 
-	if *batchSize <= 0 {
-		*batchSize = 1
-	}
-	if *areaSize <= 0 {
-		*areaSize = 100000
-	}
-	if *cellSize <= 0 {
-		*cellSize = autoCellSize(*areaSize, *riderCount)
+	if *riderCount <= 0 {
+		*riderCount = 1
 	}
 	if *workerCount <= 0 {
 		*workerCount = 1
 	}
 
-	duration, err := time.ParseDuration(*durationText)
-	if err != nil {
-		panic(err)
-	}
 	runFor, err := time.ParseDuration(*runForText)
 	if err != nil {
 		panic(err)
 	}
-	minInterval, err := time.ParseDuration(*minIntervalText)
-	if err != nil {
-		panic(err)
-	}
-	maxInterval, err := time.ParseDuration(*maxIntervalText)
-	if err != nil {
-		panic(err)
-	}
-	statsInterval, err := time.ParseDuration(*statsIntervalText)
-	if err != nil {
-		panic(err)
-	}
-	if *maxBatchSize <= 0 {
-		*maxBatchSize = *batchSize
-	}
-	if *minBatchSize <= 0 {
-		*minBatchSize = 1
-	}
-	if *maxBatchSize < *minBatchSize {
-		*maxBatchSize = *minBatchSize
-	}
-	if minInterval < 0 {
-		minInterval = 0
-	}
-	if maxInterval < minInterval {
-		maxInterval = minInterval
-	}
 
 	runtime.GOMAXPROCS(*workerCount)
 
-	rng := rand.New(rand.NewSource(*seed))
-	riders := generateRiders(rng, *riderCount, *areaSize)
-	m := matcher.NewMatcher(riders, *cellSize, *loadWeight)
-	s := scheduler.NewScheduler(*shardCount, *bufferSize, *cellSize)
+	cellSize := autoCellSize(areaSize, *riderCount)
+	riders := generateRiders(rand.New(rand.NewSource(*seed)), *riderCount, areaSize)
+	m := matcher.NewMatcher(riders, cellSize, loadWeight)
+	s := scheduler.NewScheduler(shardCount, bufferSize, cellSize, areaSize)
 	pool := scheduler.NewWorkerPool(s.Shards(), m)
 
 	s.Start()
 	pool.Start(*workerCount)
 
-	start := time.Now()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	if *continuous {
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer stop()
-
-		if runFor > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, runFor)
-			defer cancel()
-		}
-
-		done := make(chan struct{})
-		statsStopped := make(chan struct{})
-		go func() {
-			defer close(statsStopped)
-			printLiveStats(ctx, done, start, statsInterval, s, m)
-		}()
-
-		produceContinuousOrders(ctx, rng, s, *minBatchSize, *maxBatchSize, *areaSize, minInterval, maxInterval)
-		close(done)
-		<-statsStopped
-	} else {
-		produceOrders(rng, s, *orderCount, *batchSize, *areaSize, duration)
+	if runFor > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, runFor)
+		defer cancel()
 	}
 
+	start := time.Now()
+	statsDone := startStatsPrinter(ctx, start, s, m)
+
+	go produceRiderEvents(ctx, rand.New(rand.NewSource(*seed+2)), m, riders, areaSize)
+	produceOrders(ctx, rand.New(rand.NewSource(*seed+1)), s, areaSize)
+
+	<-statsDone
 	s.Close()
 	pool.Wait()
-	elapsed := time.Since(start)
-	totalOrders := int64(*orderCount)
-	if *continuous {
-		totalOrders = s.Submitted()
-	}
 
-	fmt.Printf("riders: %d\n", *riderCount)
-	fmt.Printf("orders: %d\n", totalOrders)
-	fmt.Printf("matched: %d\n", m.Matched())
-	fmt.Printf("missed: %d\n", m.Missed())
-	fmt.Printf("workers: %d\n", *workerCount)
-	fmt.Printf("shards: %d\n", *shardCount)
-	fmt.Printf("cell_size: %d\n", *cellSize)
-	fmt.Printf("submitted: %d\n", s.Submitted())
-	fmt.Printf("dispatched: %d\n", s.Dispatched())
-	fmt.Printf("elapsed: %s\n", elapsed)
-	fmt.Printf("throughput: %.2f orders/s\n", float64(totalOrders)/elapsed.Seconds())
-	printBottomRiders(riders, 10)
+	printFinalStats(start, riders, s, m, *workerCount, cellSize)
 }
 
-func generateRiders(rng *rand.Rand, n, areaSize int) []*model.Rider {
-	riders := make([]*model.Rider, 0, n)
+func generateRiders(rng *rand.Rand, count int, areaSize int) []*model.Rider {
+	riders := make([]*model.Rider, 0, count)
 
-	for i := 0; i < n; i++ {
+	for i := 0; i < count; i++ {
 		riders = append(riders, &model.Rider{
 			UID: int64(i + 1),
 			X:   rng.Intn(areaSize),
@@ -161,65 +101,18 @@ func generateRiders(rng *rand.Rand, n, areaSize int) []*model.Rider {
 	return riders
 }
 
-func produceOrders(rng *rand.Rand, s *scheduler.Scheduler, total, batchSize, areaSize int, duration time.Duration) {
-	batchCount := (total + batchSize - 1) / batchSize
-	var interval time.Duration
-
-	if duration > 0 && batchCount > 0 {
-		interval = duration / time.Duration(batchCount)
-	}
-
-	nextSend := time.Now()
-
-	for generated := 0; generated < total; {
-		size := batchSize
-		if remaining := total - generated; remaining < size {
-			size = remaining
-		}
-
-		orders := make([]model.Order, 0, size)
-		for i := 0; i < size; i++ {
-			orders = append(orders, model.Order{
-				ID: int64(generated + i + 1),
-				X:  rng.Intn(areaSize),
-				Y:  rng.Intn(areaSize),
-			})
-		}
-
-		s.SubmitBatch(model.OrderBatch{Orders: orders})
-		generated += size
-
-		if interval > 0 && generated < total {
-			nextSend = nextSend.Add(interval)
-			if sleepFor := time.Until(nextSend); sleepFor > 0 {
-				time.Sleep(sleepFor)
-			}
-		}
-	}
-}
-
-func produceContinuousOrders(
-	ctx context.Context,
-	rng *rand.Rand,
-	s *scheduler.Scheduler,
-	minBatchSize int,
-	maxBatchSize int,
-	areaSize int,
-	minInterval time.Duration,
-	maxInterval time.Duration,
-) {
+func produceOrders(ctx context.Context, rng *rand.Rand, s *scheduler.Scheduler, areaSize int) {
 	var nextOrderID int64 = 1
 
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		default:
 		}
 
-		size := randomIntRange(rng, minBatchSize, maxBatchSize)
-		orders := make([]model.Order, 0, size)
-		for i := 0; i < size; i++ {
+		batchSize := randomIntRange(rng, orderMinBatch, orderMaxBatch)
+		orders := make([]model.Order, 0, batchSize)
+
+		for i := 0; i < batchSize; i++ {
 			orders = append(orders, model.Order{
 				ID: nextOrderID,
 				X:  rng.Intn(areaSize),
@@ -228,75 +121,178 @@ func produceContinuousOrders(
 			nextOrderID++
 		}
 
-		if err := s.SubmitBatchContext(ctx, model.OrderBatch{Orders: orders}); err != nil {
+		err := s.SubmitBatchContext(ctx, model.OrderBatch{Orders: orders})
+		if err != nil {
 			return
 		}
 
-		wait := randomDurationRange(rng, minInterval, maxInterval)
-		if wait <= 0 {
-			continue
-		}
-
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
+		waitRandomDuration(ctx, rng, orderMinWait, orderMaxWait)
 	}
 }
 
-func printLiveStats(
-	ctx context.Context,
-	done <-chan struct{},
-	start time.Time,
-	interval time.Duration,
-	s *scheduler.Scheduler,
-	m *matcher.Matcher,
-) {
-	if interval <= 0 {
-		return
+func produceRiderEvents(ctx context.Context, rng *rand.Rand, m *matcher.Matcher, riders []*model.Rider, areaSize int) {
+	online := make([]bool, len(riders))
+	for i := range online {
+		online[i] = true
 	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	var lastMatched int64
-	var lastTime = start
 
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case <-done:
-			return
-		case now := <-ticker.C:
-			matched := m.Matched()
-			delta := matched - lastMatched
-			seconds := now.Sub(lastTime).Seconds()
-			rate := float64(0)
-			if seconds > 0 {
-				rate = float64(delta) / seconds
+		}
+
+		event := randomRiderEvent(rng, riders, online, areaSize)
+		m.ApplyRiderEvent(event)
+		waitRandomDuration(ctx, rng, riderMinWait, riderMaxWait)
+	}
+}
+
+func randomRiderEvent(rng *rand.Rand, riders []*model.Rider, online []bool, areaSize int) model.RiderEvent {
+	onlineCount := countOnline(online)
+	eventType := rng.Intn(100)
+
+	if eventType < 70 && onlineCount > 0 {
+		index := randomOnlineIndex(rng, online)
+		return model.RiderEvent{
+			Type: model.RiderMove,
+			UID:  riders[index].UID,
+			X:    rng.Intn(areaSize),
+			Y:    rng.Intn(areaSize),
+		}
+	}
+
+	if eventType < 85 && onlineCount > 1 {
+		index := randomOnlineIndex(rng, online)
+		online[index] = false
+		return model.RiderEvent{
+			Type: model.RiderOffline,
+			UID:  riders[index].UID,
+		}
+	}
+
+	index := randomOfflineIndex(rng, online)
+	if index >= 0 {
+		online[index] = true
+		return model.RiderEvent{
+			Type: model.RiderOnline,
+			UID:  riders[index].UID,
+			X:    rng.Intn(areaSize),
+			Y:    rng.Intn(areaSize),
+		}
+	}
+
+	index = randomOnlineIndex(rng, online)
+	return model.RiderEvent{
+		Type: model.RiderMove,
+		UID:  riders[index].UID,
+		X:    rng.Intn(areaSize),
+		Y:    rng.Intn(areaSize),
+	}
+}
+
+func startStatsPrinter(ctx context.Context, start time.Time, s *scheduler.Scheduler, m *matcher.Matcher) <-chan struct{} {
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		ticker := time.NewTicker(statsInterval)
+		defer ticker.Stop()
+
+		var lastMatched int64
+		lastTime := start
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				matched := m.Matched()
+				recentRate := ratePerSecond(matched-lastMatched, now.Sub(lastTime))
+
+				fmt.Printf(
+					"live elapsed=%s online_riders=%d submitted=%d matched=%d missed=%d recent_rate=%.2f orders/s\n",
+					now.Sub(start).Truncate(time.Millisecond),
+					m.OnlineRiders(),
+					s.Submitted(),
+					matched,
+					m.Missed(),
+					recentRate,
+				)
+
+				lastMatched = matched
+				lastTime = now
 			}
+		}
+	}()
 
-			fmt.Printf(
-				"live elapsed=%s submitted=%d dispatched=%d matched=%d missed=%d recent_rate=%.2f orders/s\n",
-				now.Sub(start).Truncate(time.Millisecond),
-				s.Submitted(),
-				s.Dispatched(),
-				matched,
-				m.Missed(),
-				rate,
-			)
+	return done
+}
 
-			lastMatched = matched
-			lastTime = now
+func printFinalStats(start time.Time, riders []*model.Rider, s *scheduler.Scheduler, m *matcher.Matcher, workerCount int, cellSize int) {
+	elapsed := time.Since(start)
+	totalOrders := s.Submitted()
+
+	fmt.Printf("riders: %d\n", len(riders))
+	fmt.Printf("online_riders: %d\n", m.OnlineRiders())
+	fmt.Printf("orders: %d\n", totalOrders)
+	fmt.Printf("matched: %d\n", m.Matched())
+	fmt.Printf("missed: %d\n", m.Missed())
+	fmt.Printf("workers: %d\n", workerCount)
+	fmt.Printf("shards: %d\n", shardCount)
+	fmt.Printf("shard_layout: %dx%d\n", s.Layout().ShardCols(), s.Layout().ShardRows())
+	fmt.Printf("cell_size: %d\n", cellSize)
+	fmt.Printf("elapsed: %s\n", elapsed)
+	fmt.Printf("throughput: %.2f orders/s\n", ratePerSecond(totalOrders, elapsed))
+	printBottomRiders(riders, 10)
+}
+
+func countOnline(online []bool) int {
+	count := 0
+	for _, isOnline := range online {
+		if isOnline {
+			count++
+		}
+	}
+	return count
+}
+
+func randomOnlineIndex(rng *rand.Rand, online []bool) int {
+	for {
+		index := rng.Intn(len(online))
+		if online[index] {
+			return index
 		}
 	}
 }
 
-func randomIntRange(rng *rand.Rand, minValue, maxValue int) int {
+func randomOfflineIndex(rng *rand.Rand, online []bool) int {
+	offlineIndexes := make([]int, 0)
+	for index, isOnline := range online {
+		if !isOnline {
+			offlineIndexes = append(offlineIndexes, index)
+		}
+	}
+
+	if len(offlineIndexes) == 0 {
+		return -1
+	}
+
+	return offlineIndexes[rng.Intn(len(offlineIndexes))]
+}
+
+func waitRandomDuration(ctx context.Context, rng *rand.Rand, minValue time.Duration, maxValue time.Duration) {
+	wait := randomDurationRange(rng, minValue, maxValue)
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+func randomIntRange(rng *rand.Rand, minValue int, maxValue int) int {
 	if maxValue <= minValue {
 		return minValue
 	}
@@ -304,7 +300,7 @@ func randomIntRange(rng *rand.Rand, minValue, maxValue int) int {
 	return minValue + rng.Intn(maxValue-minValue+1)
 }
 
-func randomDurationRange(rng *rand.Rand, minValue, maxValue time.Duration) time.Duration {
+func randomDurationRange(rng *rand.Rand, minValue time.Duration, maxValue time.Duration) time.Duration {
 	if maxValue <= minValue {
 		return minValue
 	}
@@ -313,7 +309,15 @@ func randomDurationRange(rng *rand.Rand, minValue, maxValue time.Duration) time.
 	return minValue + time.Duration(rng.Int63n(int64(delta)+1))
 }
 
-func autoCellSize(areaSize, riderCount int) int {
+func ratePerSecond(count int64, duration time.Duration) float64 {
+	if duration <= 0 {
+		return 0
+	}
+
+	return float64(count) / duration.Seconds()
+}
+
+func autoCellSize(areaSize int, riderCount int) int {
 	if riderCount <= 0 {
 		return areaSize
 	}
@@ -330,8 +334,8 @@ func autoCellSize(areaSize, riderCount int) int {
 	return int(cell)
 }
 
-func printBottomRiders(riders []*model.Rider, n int) {
-	sort.Slice(riders, func(i, j int) bool {
+func printBottomRiders(riders []*model.Rider, count int) {
+	sort.Slice(riders, func(i int, j int) bool {
 		left := atomic.LoadInt64(&riders[i].Count)
 		right := atomic.LoadInt64(&riders[j].Count)
 		if left == right {
@@ -341,7 +345,7 @@ func printBottomRiders(riders []*model.Rider, n int) {
 	})
 
 	fmt.Println("bottom riders:")
-	for i := 0; i < n && i < len(riders); i++ {
+	for i := 0; i < count && i < len(riders); i++ {
 		fmt.Printf("uid=%d count=%d\n", riders[i].UID, atomic.LoadInt64(&riders[i].Count))
 	}
 }
