@@ -1,13 +1,27 @@
 package matcher
 
-import "testP/internal/model"
+import (
+	"sync"
+	"sync/atomic"
+	"testP/internal/model"
+)
 
 const cellHashWeight = 100000
 
-// 将骑手按网格划分，避免订单全量查找每一个骑手
+type RiderCandidate struct {
+	Rider *model.Rider
+	UID   int64
+	X     int
+	Y     int
+	Count int64
+}
+
+// GridIndex 通过cell收集在线的rider
 type GridIndex struct {
 	cellSize int
-	cells    map[int][]*model.Rider
+	mu       sync.RWMutex
+	riders   map[int64]*model.Rider
+	cells    map[int]map[int64]*model.Rider
 }
 
 func NewGridIndex(riders []*model.Rider, cellSize int) *GridIndex {
@@ -17,38 +31,144 @@ func NewGridIndex(riders []*model.Rider, cellSize int) *GridIndex {
 
 	g := &GridIndex{
 		cellSize: cellSize,
-		cells:    make(map[int][]*model.Rider),
+		riders:   make(map[int64]*model.Rider),
+		cells:    make(map[int]map[int64]*model.Rider),
 	}
 
 	for _, rider := range riders {
-		cellID := g.cellID(rider.X, rider.Y)
-		g.cells[cellID] = append(g.cells[cellID], rider)
+		g.AddRider(rider)
 	}
 
 	return g
 }
 
-// 查找订单位置相邻的骑手，没有则返回nil
-func (g *GridIndex) FindNearbyRiders(x, y int, radius int) []*model.Rider {
-	cx := x / g.cellSize
-	cy := y / g.cellSize
+func (g *GridIndex) FindNearbyCandidates(x, y int, radius int) []RiderCandidate {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 
-	var result []*model.Rider
+	return g.findNearbyCandidatesLocked(x, y, radius)
+}
+
+func (g *GridIndex) findNearbyCandidatesLocked(x, y int, radius int) []RiderCandidate {
+	cellX := x / g.cellSize
+	cellY := y / g.cellSize
+
+	candidates := make([]RiderCandidate, 0)
 
 	for dx := -radius; dx <= radius; dx++ {
 		for dy := -radius; dy <= radius; dy++ {
-			cellID := g.cellIDByCell(cx+dx, cy+dy)
-			result = append(result, g.cells[cellID]...)
+			cellID := g.cellIDByCell(cellX+dx, cellY+dy)
+			for _, rider := range g.cells[cellID] {
+				candidates = append(candidates, RiderCandidate{
+					Rider: rider,
+					UID:   rider.UID,
+					X:     rider.X,
+					Y:     rider.Y,
+					Count: atomic.LoadInt64(&rider.Count),
+				})
+			}
 		}
 	}
 
-	return result
+	return candidates
+}
+
+func (g *GridIndex) AddRider(rider *model.Rider) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if current, ok := g.riders[rider.UID]; ok {
+		delete(g.cells[current.CellID], current.UID)
+		current.X = rider.X
+		current.Y = rider.Y
+		current.OnLine = true
+		current.CellID = g.cellID(current.X, current.Y)
+		g.addRiderToCell(current, current.CellID)
+		return
+	}
+
+	rider.CellID = g.cellID(rider.X, rider.Y)
+	rider.OnLine = true
+	g.riders[rider.UID] = rider
+	g.addRiderToCell(rider, rider.CellID)
+}
+
+func (g *GridIndex) MoveRider(rider *model.Rider) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	current, ok := g.riders[rider.UID]
+	if !ok || !current.OnLine {
+		return
+	}
+
+	oldCellID := current.CellID
+	newCellID := g.cellID(rider.X, rider.Y)
+
+	current.X = rider.X
+	current.Y = rider.Y
+	current.CellID = newCellID
+
+	if oldCellID == newCellID {
+		return
+	}
+
+	delete(g.cells[oldCellID], current.UID)
+	g.addRiderToCell(current, newCellID)
+}
+
+func (g *GridIndex) RemoveRider(rider *model.Rider) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	current, ok := g.riders[rider.UID]
+	if !ok || !current.OnLine {
+		return
+	}
+
+	current.OnLine = false
+	delete(g.cells[current.CellID], current.UID)
+}
+
+func (g *GridIndex) DeleteRider(rider *model.Rider) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	current, ok := g.riders[rider.UID]
+	if !ok {
+		return
+	}
+
+	current.OnLine = false
+	delete(g.cells[current.CellID], current.UID)
+	delete(g.riders, current.UID)
+}
+
+func (g *GridIndex) OnlineCount() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	count := 0
+	for _, rider := range g.riders {
+		if rider.OnLine {
+			count++
+		}
+	}
+
+	return count
 }
 
 func (g *GridIndex) cellID(x, y int) int {
 	return g.cellIDByCell(x/g.cellSize, y/g.cellSize)
 }
 
-func (g *GridIndex) cellIDByCell(cx, cy int) int {
-	return cellHashWeight*cx + cy
+func (g *GridIndex) cellIDByCell(cellX, cellY int) int {
+	return cellHashWeight*cellX + cellY
+}
+
+func (g *GridIndex) addRiderToCell(rider *model.Rider, cellID int) {
+	if g.cells[cellID] == nil {
+		g.cells[cellID] = make(map[int64]*model.Rider)
+	}
+	g.cells[cellID][rider.UID] = rider
 }
