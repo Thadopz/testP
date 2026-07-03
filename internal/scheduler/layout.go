@@ -3,21 +3,21 @@ package scheduler
 import "math"
 
 type ShardLayout struct {
-	//整个区域的边长，坐标会按这个范围进行划分。
+	//整个区域的边长，坐标会按这个范围进行划分
 	areaSize int
-	//单个网格单元的边长，用于把区域离散化。
+	//单个网格单元的边长，用于把区域离散化
 	cellSize int
-	//分片总数。
+	//分片总数
 	shardCount int
-	//分片在水平方向上的列数。
+	//分片在水平方向上的列数
 	shardCols int
-	//分片在垂直方向上的行数。
+	//分片在垂直方向上的行数
 	shardRows int
-	//每个轴上所有的网格单元。
+	//每个轴上所有的网格单元
 	cellsPerAxis int
-	//每个分片在 X 方向覆盖的网格数量。
+	//每个分片在 X 方向覆盖的网格数量
 	cellsPerShardX int
-	//每个分片在 Y 方向覆盖的网格数量。
+	//每个分片在 Y 方向覆盖的网格数量
 	cellsPerShardY int
 }
 
@@ -75,6 +75,7 @@ func (l ShardLayout) ShardID(x int, y int) int {
 	return shardID
 }
 
+// 实际上这个函数会返回自己，因为dx dy可以都取0
 func (l ShardLayout) NeighborShardIDs(shardID int) []int {
 	if shardID < 0 || shardID >= l.shardCount {
 		return nil
@@ -118,6 +119,7 @@ func (l ShardLayout) CellsPerShardY() int {
 	return l.cellsPerShardY
 }
 
+// 把value限制在范围内
 func clampInt(value int, minValue int, maxValue int) int {
 	if maxValue < minValue {
 		return minValue
