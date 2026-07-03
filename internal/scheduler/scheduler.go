@@ -10,14 +10,14 @@ import (
 type Scheduler struct {
 	shards     []*Shard
 	shardCount int
-	cellSize   int
+	layout     ShardLayout
 	inputCh    chan model.OrderBatch
 	wg         sync.WaitGroup
 	submitted  atomic.Int64
 	dispatched atomic.Int64
 }
 
-func NewScheduler(shardCount, bufferSize, cellSize int) *Scheduler {
+func NewScheduler(shardCount, bufferSize, cellSize, areaSize int) *Scheduler {
 	if shardCount <= 0 {
 		shardCount = 1
 	}
@@ -30,7 +30,7 @@ func NewScheduler(shardCount, bufferSize, cellSize int) *Scheduler {
 
 	s := &Scheduler{
 		shardCount: shardCount,
-		cellSize:   cellSize,
+		layout:     NewShardLayout(areaSize, cellSize, shardCount),
 		inputCh:    make(chan model.OrderBatch, bufferSize),
 		shards:     make([]*Shard, shardCount),
 	}
@@ -75,6 +75,10 @@ func (s *Scheduler) Shards() []*Shard {
 	return s.shards
 }
 
+func (s *Scheduler) Layout() ShardLayout {
+	return s.layout
+}
+
 func (s *Scheduler) Submitted() int64 {
 	return s.submitted.Load()
 }
@@ -106,11 +110,5 @@ func (s *Scheduler) dispatchLoop() {
 }
 
 func (s *Scheduler) shardID(x, y int) int {
-	cx := x / s.cellSize
-	cy := y / s.cellSize
-	id := (cx*73856093 ^ cy*19349663) % s.shardCount
-	if id < 0 {
-		return -id
-	}
-	return id
+	return s.layout.ShardID(x, y)
 }
