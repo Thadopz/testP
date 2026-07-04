@@ -93,20 +93,34 @@ func (s *Scheduler) dispatchLoop() {
 	defer s.wg.Done()
 
 	for batch := range s.inputCh {
-		grouped := make([][]model.Order, s.shardCount)
-
+		counts := make([]int, s.shardCount)
 		for _, order := range batch.Orders {
 			shardID := s.shardID(order.X, order.Y)
-			grouped[shardID] = append(grouped[shardID], order)
+			counts[shardID]++
 		}
 
-		for shardID, orders := range grouped {
-			if len(orders) == 0 {
+		grouped := make([][]int, s.shardCount)
+		for shardID, count := range counts {
+			if count > 0 {
+				grouped[shardID] = make([]int, 0, count)
+			}
+		}
+
+		for orderIndex, order := range batch.Orders {
+			shardID := s.shardID(order.X, order.Y)
+			grouped[shardID] = append(grouped[shardID], orderIndex)
+		}
+
+		for shardID, indexes := range grouped {
+			if len(indexes) == 0 {
 				continue
 			}
 
-			s.shards[shardID].orderCh <- model.OrderBatch{Orders: orders}
-			s.dispatched.Add(int64(len(orders)))
+			s.shards[shardID].orderCh <- model.ShardOrderBatch{
+				Orders:  batch.Orders,
+				Indexes: indexes,
+			}
+			s.dispatched.Add(int64(len(indexes)))
 		}
 	}
 }

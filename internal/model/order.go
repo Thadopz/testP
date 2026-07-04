@@ -9,3 +9,8 @@ type Order struct {
 type OrderBatch struct {
 	Orders []Order
 }
+
+type ShardOrderBatch struct {
+	Orders  []Order
+	Indexes []int
+}

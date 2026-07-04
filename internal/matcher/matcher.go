@@ -28,6 +28,12 @@ func (m *Matcher) MatchBatch(batch model.OrderBatch) {
 	}
 }
 
+func (m *Matcher) MatchShardBatch(batch model.ShardOrderBatch) {
+	for _, orderIndex := range batch.Indexes {
+		m.MatchOne(&batch.Orders[orderIndex])
+	}
+}
+
 func (m *Matcher) MatchOne(order *model.Order) *model.Rider {
 	innerRadius := -1
 

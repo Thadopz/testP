@@ -22,7 +22,7 @@ type ShardedEngine struct {
 
 type ShardRuntime struct {
 	id      int
-	orderCh chan model.OrderBatch
+	orderCh chan model.ShardOrderBatch
 	matcher *matcher.Matcher
 }
 
@@ -56,7 +56,7 @@ func NewShardedEngineWithOptions(riders []*model.Rider, shardCount int, bufferSi
 	for shardID := 0; shardID < shardCount; shardID++ {
 		shards[shardID] = &ShardRuntime{
 			id:      shardID,
-			orderCh: make(chan model.OrderBatch, bufferSize),
+			orderCh: make(chan model.ShardOrderBatch, bufferSize),
 			matcher: matcher.NewMatcher(ridersByShard[shardID], cellSize, loadWeight),
 		}
 	}
@@ -85,21 +85,36 @@ func (e *ShardedEngine) Start(workerCount int) {
 func (e *ShardedEngine) SubmitBatch(ctx context.Context, batch model.OrderBatch) error {
 	e.metrics.Submitted.Add(int64(len(batch.Orders)))
 
-	grouped := make([][]model.Order, len(e.shards))
+	counts := make([]int, len(e.shards))
 	for _, order := range batch.Orders {
 		shardID := e.layout.ShardID(order.X, order.Y)
-		grouped[shardID] = append(grouped[shardID], order)
+		counts[shardID]++
 	}
 
-	for shardID, orders := range grouped {
-		if len(orders) == 0 {
+	grouped := make([][]int, len(e.shards))
+	for shardID, count := range counts {
+		if count > 0 {
+			grouped[shardID] = make([]int, 0, count)
+		}
+	}
+
+	for orderIndex, order := range batch.Orders {
+		shardID := e.layout.ShardID(order.X, order.Y)
+		grouped[shardID] = append(grouped[shardID], orderIndex)
+	}
+
+	for shardID, indexes := range grouped {
+		if len(indexes) == 0 {
 			continue
 		}
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case e.shards[shardID].orderCh <- model.OrderBatch{Orders: orders}:
+		case e.shards[shardID].orderCh <- model.ShardOrderBatch{
+			Orders:  batch.Orders,
+			Indexes: indexes,
+		}:
 		}
 	}
 
@@ -184,9 +199,9 @@ func (e *ShardedEngine) workerLoop() {
 	}
 }
 
-func (e *ShardedEngine) matchBatch(homeShardID int, batch model.OrderBatch) {
-	for i := range batch.Orders {
-		e.matchOne(homeShardID, &batch.Orders[i])
+func (e *ShardedEngine) matchBatch(homeShardID int, batch model.ShardOrderBatch) {
+	for _, orderIndex := range batch.Indexes {
+		e.matchOne(homeShardID, &batch.Orders[orderIndex])
 	}
 }
 

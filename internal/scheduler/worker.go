@@ -57,7 +57,7 @@ func (p *WorkerPool) workerLoop(workerID int) {
 				}
 
 				hasWork = true
-				p.matcher.MatchBatch(batch)
+				p.matcher.MatchShardBatch(batch)
 
 			default:
 			}
