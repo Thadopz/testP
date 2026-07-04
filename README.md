@@ -2,7 +2,7 @@
 
 这是一个用 Go 编写的订单与骑手匹配模拟项目，用于验证在不同骑手规模、订单规模和运行时长约束下，系统能否持续生成订单并完成分配。
 
-项目采用批量流式模拟的方式：订单分批生成，生成后立即进入调度和匹配流程，同时支持骑手移动、上线、下线等动态事件，初步地模拟骑手行为，经过了六次优化，对于最慢的场景（一万骑手对应 100 万订单）的时间从27.958秒降低至。
+项目采用批量流式模拟的方式：订单分批生成，生成后立即进入调度和匹配流程，同时支持骑手移动、上线、下线等动态事件，初步地模拟骑手行为。经过了七次优化，在2核4GB的云主机上，对于最慢的场景（一万骑手对应 100 万订单）的时间从大于40秒降低至约1.8秒，其中有0.7秒用于尽快地生成批量订单（大约55w单每秒），实际处理时间约1.1秒。
 
 ## 目录结构
 
@@ -115,6 +115,8 @@ online_riders      结束时在线骑手数
 orders             订单数
 matched            成功匹配订单数
 missed             未匹配订单数
+submit_elapsed     订单生成、分批提交和动态骑手事件注入耗时
+drain_elapsed      停止提交后等待 worker 处理完队列的耗时
 elapsed            总耗时
 throughput         吞吐，orders/s
 target_elapsed     目标耗时，仅 examples profile 有值
@@ -146,16 +148,17 @@ worker：2
 
 ```text
 workers=2 profile=default batch=5000 events_per_batch=3 engine=sharded
+wall_time=0:03.73 max_rss_kb=50760
 ```
 
-| 场景 | 模式 | 骑手数 | 在线骑手 | 订单数 | 匹配数 | miss | 耗时 | 吞吐 orders/s |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100r_1w_orders | fixed | 100 | 100 | 10000 | 10000 | 0 | 5.198577ms | 1923603.32 |
-| 100r_1w_orders | dynamic | 100 | 98 | 10000 | 10000 | 0 | 4.473639ms | 2235316.71 |
-| 1000r_10w_orders | fixed | 1000 | 1000 | 100000 | 100000 | 0 | 52.235623ms | 1914402.36 |
-| 1000r_10w_orders | dynamic | 1000 | 995 | 100000 | 100000 | 0 | 52.528152ms | 1903741.06 |
-| 1w_r_100w_orders | fixed | 10000 | 10000 | 1000000 | 1000000 | 0 | 1.804420787s | 554194.46 |
-| 1w_r_100w_orders | dynamic | 10000 | 9998 | 1000000 | 1000000 | 0 | 1.84427679s | 542217.96 |
+| 场景 | 模式 | 骑手数 | 在线骑手 | 订单数 | 匹配数 | miss | 提交耗时 | 排空耗时 | 总耗时 | 吞吐 orders/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100r_1w_orders | fixed | 100 | 100 | 10000 | 10000 | 0 | 966.211µs | 3.932074ms | 4.898423ms | 2041473.35 |
+| 100r_1w_orders | dynamic | 100 | 98 | 10000 | 10000 | 0 | 807.055µs | 3.735201ms | 4.542399ms | 2201479.88 |
+| 1000r_10w_orders | fixed | 1000 | 1000 | 100000 | 100000 | 0 | 9.449717ms | 40.961777ms | 50.411715ms | 1983665.90 |
+| 1000r_10w_orders | dynamic | 1000 | 995 | 100000 | 100000 | 0 | 8.465909ms | 42.222063ms | 50.688221ms | 1972844.93 |
+| 1w_r_100w_orders | fixed | 10000 | 10000 | 1000000 | 1000000 | 0 | 696.956045ms | 1.104413728s | 1.801369981s | 555133.04 |
+| 1w_r_100w_orders | dynamic | 10000 | 9998 | 1000000 | 1000000 | 0 | 701.15445ms | 1.111083887s | 1.812238527s | 551803.74 |
 
 ### 标准 Go Benchmark
 
@@ -175,34 +178,34 @@ goos: linux
 goarch: amd64
 pkg: testP/internal/engine
 cpu: Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-BenchmarkNewShardedEngine-2                         	     381	   3189462 ns/op	 2395089 B/op	    5517 allocs/op
-BenchmarkShardedSubmitBatchRouting-2                	   18632	     64096 ns/op	   72256 B/op	     346 allocs/op
-BenchmarkShardedFindCandidatesHomeShard-2           	  118027	      9957 ns/op	   16941 B/op	       9 allocs/op
-BenchmarkShardedCollectCandidatesNeighborShards-2   	   14731	     80840 ns/op	  125920 B/op	      30 allocs/op
-BenchmarkShardedMatchOne-2                          	  110334	     10667 ns/op	   16941 B/op	       9 allocs/op
-BenchmarkShardedApplyRiderMoveSameShard-2           	18155422	        65.22 ns/op	       0 B/op	       0 allocs/op
-BenchmarkShardedApplyRiderMoveCrossShard-2          	 6911408	       174.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNewShardedEngine-2                         	     375	   3144095 ns/op	 2845648 B/op	    5517 allocs/op
+BenchmarkShardedSubmitBatchRouting-2                	   29037	     41195 ns/op	   10760 B/op	      66 allocs/op
+BenchmarkShardedFindCandidatesHomeShard-2           	  120988	      9864 ns/op	   16941 B/op	       9 allocs/op
+BenchmarkShardedCollectCandidatesNeighborShards-2   	   15620	     76844 ns/op	  125920 B/op	      30 allocs/op
+BenchmarkShardedMatchOne-2                          	  623016	      1903 ns/op	       0 B/op	       0 allocs/op
+BenchmarkShardedApplyRiderMoveSameShard-2           	18259306	        65.62 ns/op	       0 B/op	       0 allocs/op
+BenchmarkShardedApplyRiderMoveCrossShard-2          	 6890396	       173.6 ns/op	       0 B/op	       0 allocs/op
 PASS
 == matcher ==
 goos: linux
 goarch: amd64
 pkg: testP/internal/matcher
 cpu: Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-BenchmarkGridFindNearbyCandidatesRadius1-2     	   89456	     13273 ns/op	   21746 B/op	       8 allocs/op
-BenchmarkGridFindNearbyCandidatesRadius3-2     	   22431	     53559 ns/op	   80999 B/op	      10 allocs/op
-BenchmarkGridFindNearbyCandidatesRadius8-2     	    3109	    389760 ns/op	  586755 B/op	      15 allocs/op
-BenchmarkGridFindNearbyCandidatesRange0To1-2   	   90457	     13259 ns/op	   21745 B/op	       8 allocs/op
-BenchmarkGridFindNearbyCandidatesRange2To3-2   	   25419	     47376 ns/op	   74521 B/op	      10 allocs/op
-BenchmarkGridFindNearbyCandidatesRange4To8-2   	    4206	    286986 ns/op	  433532 B/op	      14 allocs/op
-BenchmarkGridMoveRider-2                       	11287210	       105.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGridFindNearbyCandidatesRadius1-2     	   90231	     13317 ns/op	   21746 B/op	       8 allocs/op
+BenchmarkGridFindNearbyCandidatesRadius3-2     	   22497	     53796 ns/op	   81001 B/op	      10 allocs/op
+BenchmarkGridFindNearbyCandidatesRadius8-2     	    3169	    396131 ns/op	  586359 B/op	      15 allocs/op
+BenchmarkGridFindNearbyCandidatesRange0To1-2   	   88975	     13329 ns/op	   21745 B/op	       8 allocs/op
+BenchmarkGridFindNearbyCandidatesRange2To3-2   	   25101	     47475 ns/op	   74509 B/op	      10 allocs/op
+BenchmarkGridFindNearbyCandidatesRange4To8-2   	    4196	    287475 ns/op	  432840 B/op	      14 allocs/op
+BenchmarkGridMoveRider-2                       	11253118	       105.9 ns/op	       0 B/op	       0 allocs/op
 PASS
 == shard ==
 goos: linux
 goarch: amd64
 pkg: testP/internal/shard
 cpu: Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-BenchmarkShardLayoutShardID-2            	98660389	        11.74 ns/op	       0 B/op	       0 allocs/op
-BenchmarkShardLayoutNeighborShardIDs-2   	26423282	        46.03 ns/op	      80 B/op	       1 allocs/op
+BenchmarkShardLayoutShardID-2            	99360358	        11.80 ns/op	       0 B/op	       0 allocs/op
+BenchmarkShardLayoutNeighborShardIDs-2   	25573957	        46.09 ns/op	      80 B/op	       1 allocs/op
 PASS
 ```
 
@@ -226,18 +229,18 @@ workers: 2
 shards: 64
 shard_layout: 8x8
 cell_size: 44721
-elapsed: 1m0.00002362s
+elapsed: 1m0.000011031s
 throughput: 839.87 orders/s
 bottom riders:
-uid=55 count=323
-uid=85 count=461
-uid=21 count=487
-uid=1 count=506
-uid=2 count=506
-uid=7 count=506
-uid=8 count=506
-uid=10 count=506
-uid=12 count=506
-uid=15 count=506
-wall_time=1:00.00 max_rss_kb=9036
+uid=55 count=316
+uid=85 count=410
+uid=2 count=450
+uid=5 count=450
+uid=12 count=450
+uid=18 count=450
+uid=24 count=450
+uid=25 count=450
+uid=29 count=450
+uid=39 count=450
+wall_time=1:00.00 max_rss_kb=8788
 ```

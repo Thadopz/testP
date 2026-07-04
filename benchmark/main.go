@@ -30,15 +30,17 @@ type Scenario struct {
 }
 
 type Result struct {
-	Scenario     Scenario
-	Dynamic      bool
-	Elapsed      time.Duration
-	Matched      int64
-	Missed       int64
-	OnlineRiders int
-	Throughput   float64
-	TargetRate   float64
-	WithinTarget bool
+	Scenario      Scenario
+	Dynamic       bool
+	SubmitElapsed time.Duration
+	DrainElapsed  time.Duration
+	Elapsed       time.Duration
+	Matched       int64
+	Missed        int64
+	OnlineRiders  int
+	Throughput    float64
+	TargetRate    float64
+	WithinTarget  bool
 }
 
 func main() {
@@ -78,7 +80,7 @@ func main() {
 	defer resultFile.Close()
 
 	header := fmt.Sprintf("workers=%d profile=%s batch=%d events_per_batch=%d engine=sharded", *workers, *profile, batchSize, *eventsPerBatch)
-	columns := "scenario,mode,riders,online_riders,orders,matched,missed,elapsed,throughput,target_elapsed,target_throughput,within_target"
+	columns := "scenario,mode,riders,online_riders,orders,matched,missed,submit_elapsed,drain_elapsed,elapsed,throughput,target_elapsed,target_throughput,within_target"
 
 	writeLine(resultFile, header)
 	writeLine(resultFile, columns)
@@ -152,18 +154,23 @@ func runScenario(scenario Scenario, dynamic bool, eventsPerBatch int, workers in
 
 	start := time.Now()
 	produceOrders(context.Background(), orderRNG, eventRNG, e, riders, scenario.OrderCount, scenario.TargetDuration, dynamic, eventsPerBatch)
+	submitElapsed := time.Since(start)
+	drainStart := time.Now()
 	e.Close()
 	e.Wait()
+	drainElapsed := time.Since(drainStart)
 	elapsed := time.Since(start)
 
 	result := Result{
-		Scenario:     scenario,
-		Dynamic:      dynamic,
-		Elapsed:      elapsed,
-		Matched:      e.Matched(),
-		Missed:       e.Missed(),
-		OnlineRiders: e.OnlineRiders(),
-		Throughput:   float64(scenario.OrderCount) / elapsed.Seconds(),
+		Scenario:      scenario,
+		Dynamic:       dynamic,
+		SubmitElapsed: submitElapsed,
+		DrainElapsed:  drainElapsed,
+		Elapsed:       elapsed,
+		Matched:       e.Matched(),
+		Missed:        e.Missed(),
+		OnlineRiders:  e.OnlineRiders(),
+		Throughput:    float64(scenario.OrderCount) / elapsed.Seconds(),
 	}
 
 	if scenario.TargetDuration > 0 {
@@ -409,7 +416,7 @@ func printResult(file *os.File, result Result) {
 	}
 
 	line := fmt.Sprintf(
-		"%s,%s,%d,%d,%d,%d,%d,%s,%.2f,%s,%s,%s\n",
+		"%s,%s,%d,%d,%d,%d,%d,%s,%s,%s,%.2f,%s,%s,%s\n",
 		result.Scenario.Name,
 		mode,
 		result.Scenario.RiderCount,
@@ -417,6 +424,8 @@ func printResult(file *os.File, result Result) {
 		result.Scenario.OrderCount,
 		result.Matched,
 		result.Missed,
+		result.SubmitElapsed,
+		result.DrainElapsed,
 		result.Elapsed,
 		result.Throughput,
 		formatTargetDuration(result.Scenario.TargetDuration),
