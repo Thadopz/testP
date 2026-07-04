@@ -23,9 +23,10 @@ const (
 )
 
 type Scenario struct {
-	Name       string
-	RiderCount int
-	OrderCount int
+	Name           string
+	RiderCount     int
+	OrderCount     int
+	TargetDuration time.Duration
 }
 
 type Result struct {
@@ -37,16 +38,24 @@ type Result struct {
 	Missed       int64
 	OnlineRiders int
 	Throughput   float64
+	TargetRate   float64
+	WithinTarget bool
 }
 
 func main() {
 	workers := flag.Int("workers", 2, "worker count")
-	profile := flag.String("profile", "default", "default or full")
+	profile := flag.String("profile", "default", "default, full, or examples")
 	engineMode := flag.String("engine", "both", "global, sharded, or both")
 	seed := flag.Int64("seed", 1, "random seed")
 	eventsPerBatch := flag.Int("events-per-batch", 3, "rider events applied per order batch in dynamic mode")
 	topK := flag.Int("top-k", 0, "maximum sharded candidates per order; 0 means unlimited")
+	showExamples := flag.Bool("show-examples", false, "print example benchmark scenarios and exit")
 	flag.Parse()
+
+	if *showExamples {
+		printExampleScenarios(exampleScenarios())
+		return
+	}
 
 	if *workers <= 0 {
 		*workers = 1
@@ -61,7 +70,9 @@ func main() {
 	runtime.GOMAXPROCS(*workers)
 
 	scenarios := defaultScenarios()
-	if *profile == "full" {
+	if *profile == "examples" {
+		scenarios = exampleScenarios()
+	} else if *profile == "full" {
 		scenarios = fullScenarios()
 	}
 
@@ -73,7 +84,7 @@ func main() {
 	defer resultFile.Close()
 
 	header := fmt.Sprintf("workers=%d profile=%s batch=%d events_per_batch=%d engine=%s top_k=%d", *workers, *profile, batchSize, *eventsPerBatch, *engineMode, *topK)
-	columns := "scenario,engine,mode,riders,online_riders,orders,matched,missed,elapsed,throughput"
+	columns := "scenario,engine,mode,riders,online_riders,orders,matched,missed,elapsed,throughput,target_elapsed,target_throughput,within_target"
 
 	writeLine(resultFile, header)
 	writeLine(resultFile, columns)
@@ -123,6 +134,30 @@ func fullScenarios() []Scenario {
 	}
 }
 
+func exampleScenarios() []Scenario {
+	return []Scenario{
+		{Name: "1m_1000r_10w_orders", RiderCount: 1000, OrderCount: 100000, TargetDuration: time.Minute},
+		{Name: "3m_1w_r_100w_orders", RiderCount: 10000, OrderCount: 1000000, TargetDuration: 3 * time.Minute},
+		{Name: "10m_10w_r_1000w_orders", RiderCount: 100000, OrderCount: 10000000, TargetDuration: 10 * time.Minute},
+	}
+}
+
+func printExampleScenarios(scenarios []Scenario) {
+	fmt.Println("example benchmark scenarios:")
+	fmt.Println("scenario,riders,orders,target_elapsed,target_throughput")
+	for _, scenario := range scenarios {
+		fmt.Printf(
+			"%s,%d,%d,%s,%.2f orders/s\n",
+			scenario.Name,
+			scenario.RiderCount,
+			scenario.OrderCount,
+			scenario.TargetDuration,
+			float64(scenario.OrderCount)/scenario.TargetDuration.Seconds(),
+		)
+	}
+	fmt.Println("run with: go run ./benchmark -profile examples -engine sharded")
+}
+
 func runScenario(scenario Scenario, engineName string, dynamic bool, eventsPerBatch int, workers int, topK int, seed int64) Result {
 	riderRNG := rand.New(rand.NewSource(seed))
 	orderRNG := rand.New(rand.NewSource(seed + 1))
@@ -135,12 +170,12 @@ func runScenario(scenario Scenario, engineName string, dynamic bool, eventsPerBa
 	e.Start(workers)
 
 	start := time.Now()
-	produceOrders(context.Background(), orderRNG, eventRNG, e, riders, scenario.OrderCount, dynamic, eventsPerBatch)
+	produceOrders(context.Background(), orderRNG, eventRNG, e, riders, scenario.OrderCount, scenario.TargetDuration, dynamic, eventsPerBatch)
 	e.Close()
 	e.Wait()
 	elapsed := time.Since(start)
 
-	return Result{
+	result := Result{
 		Scenario:     scenario,
 		Engine:       engineName,
 		Dynamic:      dynamic,
@@ -150,6 +185,13 @@ func runScenario(scenario Scenario, engineName string, dynamic bool, eventsPerBa
 		OnlineRiders: e.OnlineRiders(),
 		Throughput:   float64(scenario.OrderCount) / elapsed.Seconds(),
 	}
+
+	if scenario.TargetDuration > 0 {
+		result.TargetRate = float64(scenario.OrderCount) / scenario.TargetDuration.Seconds()
+		result.WithinTarget = elapsed <= scenario.TargetDuration
+	}
+
+	return result
 }
 
 func newEngine(engineName string, riders []*model.Rider, cellSize int, topK int) engine.Engine {
@@ -175,6 +217,7 @@ func produceOrders(
 	e engine.Engine,
 	riders []*model.Rider,
 	totalOrders int,
+	targetDuration time.Duration,
 	dynamic bool,
 	eventsPerBatch int,
 ) {
@@ -183,6 +226,7 @@ func produceOrders(
 		online[i] = true
 	}
 
+	start := time.Now()
 	for generated := 0; generated < totalOrders; {
 		size := batchSize
 		if remaining := totalOrders - generated; remaining < size {
@@ -200,6 +244,29 @@ func produceOrders(
 		}
 
 		generated += size
+		waitForTargetRate(ctx, start, generated, totalOrders, targetDuration)
+	}
+}
+
+func waitForTargetRate(ctx context.Context, start time.Time, generated int, totalOrders int, targetDuration time.Duration) {
+	if targetDuration <= 0 || totalOrders <= 0 {
+		return
+	}
+
+	progress := float64(generated) / float64(totalOrders)
+	targetElapsed := time.Duration(progress * float64(targetDuration))
+	targetTime := start.Add(targetElapsed)
+	wait := time.Until(targetTime)
+	if wait <= 0 {
+		return
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
 	}
 }
 
@@ -368,7 +435,7 @@ func printResult(file *os.File, result Result) {
 	}
 
 	line := fmt.Sprintf(
-		"%s,%s,%s,%d,%d,%d,%d,%d,%s,%.2f\n",
+		"%s,%s,%s,%d,%d,%d,%d,%d,%s,%.2f,%s,%s,%s\n",
 		result.Scenario.Name,
 		result.Engine,
 		mode,
@@ -379,8 +446,35 @@ func printResult(file *os.File, result Result) {
 		result.Missed,
 		result.Elapsed,
 		result.Throughput,
+		formatTargetDuration(result.Scenario.TargetDuration),
+		formatTargetRate(result.TargetRate),
+		formatWithinTarget(result.Scenario.TargetDuration, result.WithinTarget),
 	)
 
 	fmt.Print(line)
 	fmt.Fprint(file, line)
+}
+
+func formatTargetDuration(duration time.Duration) string {
+	if duration <= 0 {
+		return ""
+	}
+	return duration.String()
+}
+
+func formatTargetRate(rate float64) string {
+	if rate <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%.2f", rate)
+}
+
+func formatWithinTarget(targetDuration time.Duration, withinTarget bool) string {
+	if targetDuration <= 0 {
+		return ""
+	}
+	if withinTarget {
+		return "true"
+	}
+	return "false"
 }
