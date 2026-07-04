@@ -43,30 +43,30 @@ func NewGridIndex(riders []*model.Rider, cellSize int) *GridIndex {
 }
 
 func (g *GridIndex) FindNearbyCandidates(x, y int, radius int) []RiderCandidate {
+	return g.FindNearbyCandidatesInRange(x, y, -1, radius)
+}
+
+func (g *GridIndex) FindNearbyCandidatesInRange(x, y int, innerRadius int, outerRadius int) []RiderCandidate {
+	if outerRadius < 0 || outerRadius <= innerRadius {
+		return nil
+	}
+
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	return g.findNearbyCandidatesLocked(x, y, radius)
-}
-
-func (g *GridIndex) findNearbyCandidatesLocked(x, y int, radius int) []RiderCandidate {
 	cellX := x / g.cellSize
 	cellY := y / g.cellSize
 
 	candidates := make([]RiderCandidate, 0)
 
-	for dx := -radius; dx <= radius; dx++ {
-		for dy := -radius; dy <= radius; dy++ {
-			cellID := g.cellIDByCell(cellX+dx, cellY+dy)
-			for _, rider := range g.cells[cellID] {
-				candidates = append(candidates, RiderCandidate{
-					Rider: rider,
-					UID:   rider.UID,
-					X:     rider.X,
-					Y:     rider.Y,
-					Count: atomic.LoadInt64(&rider.Count),
-				})
+	for dx := -outerRadius; dx <= outerRadius; dx++ {
+		for dy := -outerRadius; dy <= outerRadius; dy++ {
+			if maxInt(absInt(dx), absInt(dy)) <= innerRadius {
+				continue
 			}
+
+			cellID := g.cellIDByCell(cellX+dx, cellY+dy)
+			candidates = g.appendCellCandidates(candidates, cellID)
 		}
 	}
 
@@ -171,4 +171,32 @@ func (g *GridIndex) addRiderToCell(rider *model.Rider, cellID int) {
 		g.cells[cellID] = make(map[int64]*model.Rider)
 	}
 	g.cells[cellID][rider.UID] = rider
+}
+
+func (g *GridIndex) appendCellCandidates(candidates []RiderCandidate, cellID int) []RiderCandidate {
+	for _, rider := range g.cells[cellID] {
+		candidates = append(candidates, RiderCandidate{
+			Rider: rider,
+			UID:   rider.UID,
+			X:     rider.X,
+			Y:     rider.Y,
+			Count: atomic.LoadInt64(&rider.Count),
+		})
+	}
+
+	return candidates
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func maxInt(left int, right int) int {
+	if left > right {
+		return left
+	}
+	return right
 }

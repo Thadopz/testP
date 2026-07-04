@@ -26,6 +26,8 @@ type ShardRuntime struct {
 	matcher *matcher.Matcher
 }
 
+var candidateSearchRadii = []int{1, 3, 8}
+
 func NewShardedEngine(riders []*model.Rider, shardCount int, bufferSize int, cellSize int, areaSize int, loadWeight int64) *ShardedEngine {
 	return NewShardedEngineWithOptions(riders, shardCount, bufferSize, cellSize, areaSize, loadWeight, ShardedOptions{})
 }
@@ -189,13 +191,7 @@ func (e *ShardedEngine) matchBatch(homeShardID int, batch model.OrderBatch) {
 }
 
 func (e *ShardedEngine) matchOne(homeShardID int, order *model.Order) {
-	candidates := e.findCandidates(homeShardID, order)
-	if len(candidates) == 0 {
-		e.metrics.Missed.Add(1)
-		return
-	}
-
-	best := e.shards[homeShardID].matcher.BestCandidate(order, candidates)
+	best := e.findBestRider(homeShardID, order)
 	if best == nil {
 		e.metrics.Missed.Add(1)
 		return
@@ -205,27 +201,73 @@ func (e *ShardedEngine) matchOne(homeShardID int, order *model.Order) {
 	e.metrics.Matched.Add(1)
 }
 
-func (e *ShardedEngine) findCandidates(homeShardID int, order *model.Order) []matcher.RiderCandidate {
-	radii := []int{1, 3, 8}
-	//这么写是为了匹配方法中的参数，省的再写一个
+func (e *ShardedEngine) findBestRider(homeShardID int, order *model.Order) *model.Rider {
+	if e.topK > 0 {
+		candidates := e.findCandidates(homeShardID, order)
+		if len(candidates) == 0 {
+			return nil
+		}
+		return e.shards[homeShardID].matcher.BestCandidate(order, candidates)
+	}
+
 	homeShardIDs := []int{homeShardID}
-	//如果在本shard中找的到人，则直接返回，不再进行额外的查找
-	for _, radius := range radii {
-		candidates := e.collectCandidates(homeShardIDs, order, radius)
-		if len(candidates) > 0 {
-			return candidates
+	innerRadius := -1
+	for _, outerRadius := range candidateSearchRadii {
+		best := e.bestRiderInShards(homeShardIDs, order, innerRadius, outerRadius)
+		if best != nil {
+			return best
 		}
+		innerRadius = outerRadius
 	}
-	//找不到了只能退化到从邻居找shard再找人，效率奇低无比，对速度影响较大
+
 	neighborShardIDs := e.neighborShardIDs(homeShardID)
-	for _, radius := range radii {
-		candidates := e.collectCandidates(neighborShardIDs, order, radius)
+	innerRadius = -1
+	for _, outerRadius := range candidateSearchRadii {
+		best := e.bestRiderInShards(neighborShardIDs, order, innerRadius, outerRadius)
+		if best != nil {
+			return best
+		}
+		innerRadius = outerRadius
+	}
+
+	fallbackShardIDs := e.unsearchedShardIDs(homeShardID, neighborShardIDs)
+	return e.bestRiderInShards(fallbackShardIDs, order, -1, 8)
+}
+
+func (e *ShardedEngine) bestRiderInShards(shardIDs []int, order *model.Order, innerRadius int, outerRadius int) *model.Rider {
+	var best *model.Rider
+	scorer := e.shards[0].matcher
+
+	for _, shardID := range shardIDs {
+		candidate := e.shards[shardID].matcher.BestNearbyRiderInRange(order, innerRadius, outerRadius)
+		best = scorer.BetterRider(order, best, candidate)
+	}
+
+	return best
+}
+
+func (e *ShardedEngine) findCandidates(homeShardID int, order *model.Order) []matcher.RiderCandidate {
+	homeShardIDs := []int{homeShardID}
+	innerRadius := -1
+	for _, outerRadius := range candidateSearchRadii {
+		candidates := e.collectCandidatesInRange(homeShardIDs, order, innerRadius, outerRadius)
 		if len(candidates) > 0 {
 			return candidates
 		}
+		innerRadius = outerRadius
 	}
-	//邻居都找不到了继续退化到全局找人
-	return e.collectCandidates(e.allShardIDs(), order, 8)
+
+	neighborShardIDs := e.neighborShardIDs(homeShardID)
+	innerRadius = -1
+	for _, outerRadius := range candidateSearchRadii {
+		candidates := e.collectCandidatesInRange(neighborShardIDs, order, innerRadius, outerRadius)
+		if len(candidates) > 0 {
+			return candidates
+		}
+		innerRadius = outerRadius
+	}
+
+	return e.collectCandidates(e.unsearchedShardIDs(homeShardID, neighborShardIDs), order, 8)
 }
 
 func (e *ShardedEngine) neighborShardIDs(homeShardID int) []int {
@@ -254,11 +296,37 @@ func (e *ShardedEngine) collectCandidates(shardIDs []int, order *model.Order, ra
 	return candidates
 }
 
-func (e *ShardedEngine) allShardIDs() []int {
-	ids := make([]int, len(e.shards))
-	for i := range ids {
-		ids[i] = i
+func (e *ShardedEngine) collectCandidatesInRange(shardIDs []int, order *model.Order, innerRadius int, outerRadius int) []matcher.RiderCandidate {
+	candidates := make([]matcher.RiderCandidate, 0)
+
+	for _, shardID := range shardIDs {
+		candidates = append(candidates, e.shards[shardID].matcher.FindNearbyCandidatesInRange(order.X, order.Y, innerRadius, outerRadius)...)
+		if e.topK > 0 && len(candidates) >= e.topK {
+			return candidates[:e.topK]
+		}
 	}
+
+	return candidates
+}
+
+func (e *ShardedEngine) unsearchedShardIDs(homeShardID int, neighborShardIDs []int) []int {
+	searched := make([]bool, len(e.shards))
+	if homeShardID >= 0 && homeShardID < len(searched) {
+		searched[homeShardID] = true
+	}
+	for _, shardID := range neighborShardIDs {
+		if shardID >= 0 && shardID < len(searched) {
+			searched[shardID] = true
+		}
+	}
+
+	ids := make([]int, 0, len(e.shards))
+	for shardID := range e.shards {
+		if !searched[shardID] {
+			ids = append(ids, shardID)
+		}
+	}
+
 	return ids
 }
 

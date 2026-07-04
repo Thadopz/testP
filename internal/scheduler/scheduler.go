@@ -4,17 +4,19 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"testP/internal/matcher"
 	"testP/internal/model"
 )
 
 type Scheduler struct {
-	shards     []*Shard
-	shardCount int
-	layout     ShardLayout
-	inputCh    chan model.OrderBatch
-	wg         sync.WaitGroup
-	submitted  atomic.Int64
-	dispatched atomic.Int64
+	shards       []*Shard
+	shardCount   int
+	layout       ShardLayout
+	inputCh      chan model.OrderBatch
+	riderEventCh chan model.RiderEvent
+	wg           sync.WaitGroup
+	submitted    atomic.Int64
+	dispatched   atomic.Int64
 }
 
 func NewScheduler(shardCount, bufferSize, cellSize, areaSize int) *Scheduler {
@@ -106,6 +108,12 @@ func (s *Scheduler) dispatchLoop() {
 			s.shards[shardID].orderCh <- model.OrderBatch{Orders: orders}
 			s.dispatched.Add(int64(len(orders)))
 		}
+	}
+}
+
+func (s *Scheduler) riderEventLoop(m *matcher.Matcher) {
+	for event := range s.riderEventCh {
+		m.ApplyRiderEvent(event)
 	}
 }
 
