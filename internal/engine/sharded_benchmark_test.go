@@ -46,7 +46,7 @@ func BenchmarkShardedSubmitBatchRouting(b *testing.B) {
 
 	for _, shard := range e.shards {
 		drainWG.Add(1)
-		go func(shard *ShardRuntime) {
+		go func(shard *Shard) {
 			defer drainWG.Done()
 			for range shard.orderCh {
 			}

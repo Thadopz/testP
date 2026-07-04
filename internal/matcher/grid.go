@@ -42,10 +42,12 @@ func NewGridIndex(riders []*model.Rider, cellSize int) *GridIndex {
 	return g
 }
 
+// 已弃用
 func (g *GridIndex) FindNearbyCandidates(x, y int, radius int) []RiderCandidate {
 	return g.FindNearbyCandidatesInRange(x, y, -1, radius)
 }
 
+// 已弃用
 func (g *GridIndex) FindNearbyCandidatesInRange(x, y int, innerRadius int, outerRadius int) []RiderCandidate {
 	if outerRadius < 0 || outerRadius <= innerRadius {
 		return nil
@@ -162,6 +164,7 @@ func (g *GridIndex) cellID(x, y int) int {
 	return g.cellIDByCell(x/g.cellSize, y/g.cellSize)
 }
 
+// 将Cell内(x,y)一维化为weight*x+y
 func (g *GridIndex) cellIDByCell(cellX, cellY int) int {
 	return cellHashWeight*cellX + cellY
 }
@@ -173,6 +176,7 @@ func (g *GridIndex) addRiderToCell(rider *model.Rider, cellID int) {
 	g.cells[cellID][rider.UID] = rider
 }
 
+// 已弃用
 func (g *GridIndex) appendCellCandidates(candidates []RiderCandidate, cellID int) []RiderCandidate {
 	for _, rider := range g.cells[cellID] {
 		candidates = append(candidates, RiderCandidate{

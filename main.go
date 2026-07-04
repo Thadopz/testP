@@ -12,9 +12,8 @@ import (
 	"sort"
 	"sync/atomic"
 	"syscall"
-	"testP/internal/matcher"
+	"testP/internal/engine"
 	"testP/internal/model"
-	"testP/internal/scheduler"
 	"time"
 )
 
@@ -58,12 +57,9 @@ func main() {
 
 	cellSize := autoCellSize(areaSize, *riderCount)
 	riders := generateRiders(rand.New(rand.NewSource(*seed)), *riderCount, areaSize)
-	m := matcher.NewMatcher(riders, cellSize, loadWeight)
-	s := scheduler.NewScheduler(shardCount, bufferSize, cellSize, areaSize)
-	pool := scheduler.NewWorkerPool(s.Shards(), m)
+	e := engine.NewShardedEngine(riders, shardCount, bufferSize, cellSize, areaSize, loadWeight)
 
-	s.Start()
-	pool.Start(*workerCount)
+	e.Start(*workerCount)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -75,16 +71,16 @@ func main() {
 	}
 
 	start := time.Now()
-	statsDone := startStatsPrinter(ctx, start, s, m)
+	statsDone := startStatsPrinter(ctx, start, e)
 
-	go produceRiderEvents(ctx, rand.New(rand.NewSource(*seed+2)), m, riders, areaSize)
-	produceOrders(ctx, rand.New(rand.NewSource(*seed+1)), s, areaSize)
+	go produceRiderEvents(ctx, rand.New(rand.NewSource(*seed+2)), e, riders, areaSize)
+	produceOrders(ctx, rand.New(rand.NewSource(*seed+1)), e, areaSize)
 
 	<-statsDone
-	s.Close()
-	pool.Wait()
+	e.Close()
+	e.Wait()
 
-	printFinalStats(start, riders, s, m, *workerCount, cellSize)
+	printFinalStats(start, riders, e, *workerCount, cellSize)
 }
 
 func generateRiders(rng *rand.Rand, count int, areaSize int) []*model.Rider {
@@ -101,7 +97,7 @@ func generateRiders(rng *rand.Rand, count int, areaSize int) []*model.Rider {
 	return riders
 }
 
-func produceOrders(ctx context.Context, rng *rand.Rand, s *scheduler.Scheduler, areaSize int) {
+func produceOrders(ctx context.Context, rng *rand.Rand, e engine.Engine, areaSize int) {
 	var nextOrderID int64 = 1
 
 	for {
@@ -121,7 +117,7 @@ func produceOrders(ctx context.Context, rng *rand.Rand, s *scheduler.Scheduler, 
 			nextOrderID++
 		}
 
-		err := s.SubmitBatchContext(ctx, model.OrderBatch{Orders: orders})
+		err := e.SubmitBatch(ctx, model.OrderBatch{Orders: orders})
 		if err != nil {
 			return
 		}
@@ -130,7 +126,7 @@ func produceOrders(ctx context.Context, rng *rand.Rand, s *scheduler.Scheduler, 
 	}
 }
 
-func produceRiderEvents(ctx context.Context, rng *rand.Rand, m *matcher.Matcher, riders []*model.Rider, areaSize int) {
+func produceRiderEvents(ctx context.Context, rng *rand.Rand, e engine.Engine, riders []*model.Rider, areaSize int) {
 	online := make([]bool, len(riders))
 	for i := range online {
 		online[i] = true
@@ -142,7 +138,7 @@ func produceRiderEvents(ctx context.Context, rng *rand.Rand, m *matcher.Matcher,
 		}
 
 		event := randomRiderEvent(rng, riders, online, areaSize)
-		m.ApplyRiderEvent(event)
+		e.ApplyRiderEvent(event)
 		waitRandomDuration(ctx, rng, riderMinWait, riderMaxWait)
 	}
 }
@@ -190,7 +186,7 @@ func randomRiderEvent(rng *rand.Rand, riders []*model.Rider, online []bool, area
 	}
 }
 
-func startStatsPrinter(ctx context.Context, start time.Time, s *scheduler.Scheduler, m *matcher.Matcher) <-chan struct{} {
+func startStatsPrinter(ctx context.Context, start time.Time, e engine.Engine) <-chan struct{} {
 	done := make(chan struct{})
 
 	go func() {
@@ -207,16 +203,16 @@ func startStatsPrinter(ctx context.Context, start time.Time, s *scheduler.Schedu
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
-				matched := m.Matched()
+				matched := e.Matched()
 				recentRate := ratePerSecond(matched-lastMatched, now.Sub(lastTime))
 
 				fmt.Printf(
 					"live elapsed=%s online_riders=%d submitted=%d matched=%d missed=%d recent_rate=%.2f orders/s\n",
 					now.Sub(start).Truncate(time.Millisecond),
-					m.OnlineRiders(),
-					s.Submitted(),
+					e.OnlineRiders(),
+					e.Submitted(),
 					matched,
-					m.Missed(),
+					e.Missed(),
 					recentRate,
 				)
 
@@ -229,18 +225,19 @@ func startStatsPrinter(ctx context.Context, start time.Time, s *scheduler.Schedu
 	return done
 }
 
-func printFinalStats(start time.Time, riders []*model.Rider, s *scheduler.Scheduler, m *matcher.Matcher, workerCount int, cellSize int) {
+func printFinalStats(start time.Time, riders []*model.Rider, e *engine.ShardedEngine, workerCount int, cellSize int) {
 	elapsed := time.Since(start)
-	totalOrders := s.Submitted()
+	totalOrders := e.Submitted()
+	layout := e.Layout()
 
 	fmt.Printf("riders: %d\n", len(riders))
-	fmt.Printf("online_riders: %d\n", m.OnlineRiders())
+	fmt.Printf("online_riders: %d\n", e.OnlineRiders())
 	fmt.Printf("orders: %d\n", totalOrders)
-	fmt.Printf("matched: %d\n", m.Matched())
-	fmt.Printf("missed: %d\n", m.Missed())
+	fmt.Printf("matched: %d\n", e.Matched())
+	fmt.Printf("missed: %d\n", e.Missed())
 	fmt.Printf("workers: %d\n", workerCount)
 	fmt.Printf("shards: %d\n", shardCount)
-	fmt.Printf("shard_layout: %dx%d\n", s.Layout().ShardCols(), s.Layout().ShardRows())
+	fmt.Printf("shard_layout: %dx%d\n", layout.ShardCols(), layout.ShardRows())
 	fmt.Printf("cell_size: %d\n", cellSize)
 	fmt.Printf("elapsed: %s\n", elapsed)
 	fmt.Printf("throughput: %.2f orders/s\n", ratePerSecond(totalOrders, elapsed))

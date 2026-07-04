@@ -1,8 +1,6 @@
-package scheduler
+package shard
 
 import (
-	"runtime"
-	"sync"
 	"testing"
 
 	"testP/internal/model"
@@ -21,7 +19,7 @@ var (
 )
 
 func BenchmarkShardLayoutShardID(b *testing.B) {
-	layout := NewShardLayout(benchAreaSize, benchCellSize, benchShardCount)
+	layout := NewLayout(benchAreaSize, benchCellSize, benchShardCount)
 	orders := benchOrders(benchBatchSize, benchAreaSize)
 
 	b.ReportAllocs()
@@ -34,7 +32,7 @@ func BenchmarkShardLayoutShardID(b *testing.B) {
 }
 
 func BenchmarkShardLayoutNeighborShardIDs(b *testing.B) {
-	layout := NewShardLayout(benchAreaSize, benchCellSize, benchShardCount)
+	layout := NewLayout(benchAreaSize, benchCellSize, benchShardCount)
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -42,36 +40,6 @@ func BenchmarkShardLayoutNeighborShardIDs(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		benchNeighborsSink = layout.NeighborShardIDs(i % benchShardCount)
 	}
-}
-
-func BenchmarkSchedulerDispatchBatch(b *testing.B) {
-	s := NewScheduler(benchShardCount, 256, benchCellSize, benchAreaSize)
-	batch := model.OrderBatch{Orders: benchOrders(benchBatchSize, benchAreaSize)}
-	var drainWG sync.WaitGroup
-
-	for _, shard := range s.shards {
-		drainWG.Add(1)
-		go func(shard *Shard) {
-			defer drainWG.Done()
-			for range shard.orderCh {
-			}
-		}(shard)
-	}
-
-	s.Start()
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		s.SubmitBatch(batch)
-	}
-	for s.Dispatched() < int64(b.N*len(batch.Orders)) {
-		runtime.Gosched()
-	}
-
-	b.StopTimer()
-	s.Close()
-	drainWG.Wait()
 }
 
 func benchOrders(count int, areaSize int) []model.Order {

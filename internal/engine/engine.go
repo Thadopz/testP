@@ -24,7 +24,3 @@ type Metrics struct {
 	Matched   atomic.Int64
 	Missed    atomic.Int64
 }
-
-type ShardedOptions struct {
-	TopK int
-}

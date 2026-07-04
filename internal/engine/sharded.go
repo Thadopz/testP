@@ -2,25 +2,32 @@ package engine
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testP/internal/matcher"
 	"testP/internal/model"
-	"testP/internal/scheduler"
+	"testP/internal/shard"
 )
 
 type ShardedEngine struct {
-	layout      scheduler.ShardLayout
-	shards      []*ShardRuntime
+	//网格划分，engine用它才能求出shardID
+	layout shard.Layout
+	shards []*Shard
+	//UID-rider映射对
 	ridersByUID map[int64]*model.Rider
-	riderShard  map[int64]int
-	mu          sync.Mutex
-	metrics     *Metrics
-	topK        int
-	wg          sync.WaitGroup
+	//存储rider处于哪个shard
+	riderShard map[int64]int
+	//mutex只用于riderEvent的匹配，目前并不是性能瓶颈(详见benchmark)故先将就让事件用全局锁了
+	mu sync.Mutex
+	//指标
+	metrics *Metrics
+	wg      sync.WaitGroup
 }
 
-type ShardRuntime struct {
+// 每个shard持有一个matcher与订单channel，订单会分散到各个shard中并发处理订单
+// 相比于全局锁，分片处理在1w骑手100w订单的情况下快了将近90倍
+type Shard struct {
 	id      int
 	orderCh chan model.ShardOrderBatch
 	matcher *matcher.Matcher
@@ -29,32 +36,28 @@ type ShardRuntime struct {
 var candidateSearchRadii = []int{1, 3, 8}
 
 func NewShardedEngine(riders []*model.Rider, shardCount int, bufferSize int, cellSize int, areaSize int, loadWeight int64) *ShardedEngine {
-	return NewShardedEngineWithOptions(riders, shardCount, bufferSize, cellSize, areaSize, loadWeight, ShardedOptions{})
-}
-
-func NewShardedEngineWithOptions(riders []*model.Rider, shardCount int, bufferSize int, cellSize int, areaSize int, loadWeight int64, options ShardedOptions) *ShardedEngine {
 	if shardCount <= 0 {
 		shardCount = 1
 	}
 	if bufferSize <= 0 {
 		bufferSize = 1
 	}
-
-	layout := scheduler.NewShardLayout(areaSize, cellSize, shardCount)
+	//初始化网格
+	layout := shard.NewLayout(areaSize, cellSize, shardCount)
 	ridersByShard := make([][]*model.Rider, shardCount)
 	ridersByUID := make(map[int64]*model.Rider, len(riders))
 	riderShard := make(map[int64]int, len(riders))
-
+	//初始化rider
 	for _, rider := range riders {
 		shardID := layout.ShardID(rider.X, rider.Y)
 		ridersByShard[shardID] = append(ridersByShard[shardID], rider)
 		ridersByUID[rider.UID] = rider
 		riderShard[rider.UID] = shardID
 	}
-
-	shards := make([]*ShardRuntime, shardCount)
+	//初始化shard
+	shards := make([]*Shard, shardCount)
 	for shardID := 0; shardID < shardCount; shardID++ {
-		shards[shardID] = &ShardRuntime{
+		shards[shardID] = &Shard{
 			id:      shardID,
 			orderCh: make(chan model.ShardOrderBatch, bufferSize),
 			matcher: matcher.NewMatcher(ridersByShard[shardID], cellSize, loadWeight),
@@ -67,10 +70,10 @@ func NewShardedEngineWithOptions(riders []*model.Rider, shardCount int, bufferSi
 		ridersByUID: ridersByUID,
 		riderShard:  riderShard,
 		metrics:     &Metrics{},
-		topK:        options.TopK,
 	}
 }
 
+// 启动所有workerLoop
 func (e *ShardedEngine) Start(workerCount int) {
 	if workerCount <= 0 {
 		workerCount = 1
@@ -90,14 +93,16 @@ func (e *ShardedEngine) SubmitBatch(ctx context.Context, batch model.OrderBatch)
 		shardID := e.layout.ShardID(order.X, order.Y)
 		counts[shardID]++
 	}
-
+	//提前计算shardID并填入int切片中，同时给grouped预设空间，结果减少了BatchSubmit约61%的内存分配
 	grouped := make([][]int, len(e.shards))
 	for shardID, count := range counts {
 		if count > 0 {
 			grouped[shardID] = make([]int, 0, count)
 		}
 	}
-
+	//diff: grouped内只存batch的index，在前者在BatchSubmit中61%的内存减耗上再次减少了60%分配但是端到端benchmark的速度略慢，
+	//代价是batch的生命周期被进一步拉长，遇到大订单迟迟不能被消耗就可能有内存的滞留
+	//同时现在再也不能修改订单了，这对鲁棒性的削弱无疑是相当大的
 	for orderIndex, order := range batch.Orders {
 		shardID := e.layout.ShardID(order.X, order.Y)
 		grouped[shardID] = append(grouped[shardID], orderIndex)
@@ -141,10 +146,12 @@ func (e *ShardedEngine) Close() {
 	}
 }
 
+// 暴露wg.Wait供外部调用等待
 func (e *ShardedEngine) Wait() {
 	e.wg.Wait()
 }
 
+// 暴露指标提供给入口
 func (e *ShardedEngine) Submitted() int64 {
 	return e.metrics.Submitted.Load()
 }
@@ -163,6 +170,10 @@ func (e *ShardedEngine) OnlineRiders() int {
 		total += shard.matcher.OnlineRiders()
 	}
 	return total
+}
+
+func (e *ShardedEngine) Layout() shard.Layout {
+	return e.layout
 }
 
 func (e *ShardedEngine) workerLoop() {
@@ -194,17 +205,19 @@ func (e *ShardedEngine) workerLoop() {
 		}
 
 		if !hasWork {
-			runtimeGosched()
+			runtime.Gosched()
 		}
 	}
 }
 
+// 匹配批量订单
 func (e *ShardedEngine) matchBatch(homeShardID int, batch model.ShardOrderBatch) {
 	for _, orderIndex := range batch.Indexes {
 		e.matchOne(homeShardID, &batch.Orders[orderIndex])
 	}
 }
 
+// 匹配单个订单
 func (e *ShardedEngine) matchOne(homeShardID int, order *model.Order) {
 	best := e.findBestRider(homeShardID, order)
 	if best == nil {
@@ -217,16 +230,11 @@ func (e *ShardedEngine) matchOne(homeShardID int, order *model.Order) {
 }
 
 func (e *ShardedEngine) findBestRider(homeShardID int, order *model.Order) *model.Rider {
-	if e.topK > 0 {
-		candidates := e.findCandidates(homeShardID, order)
-		if len(candidates) == 0 {
-			return nil
-		}
-		return e.shards[homeShardID].matcher.BestCandidate(order, candidates)
-	}
-
+	//写成切片是为了符合bestRiderInShards的参数要求，避免重新写一个差不多功能的方法
 	homeShardIDs := []int{homeShardID}
+	//内径，初值为-1，用于环形检测
 	innerRadius := -1
+	//查找homeshard内有无骑手并从其中选出最佳
 	for _, outerRadius := range candidateSearchRadii {
 		best := e.bestRiderInShards(homeShardIDs, order, innerRadius, outerRadius)
 		if best != nil {
@@ -234,7 +242,7 @@ func (e *ShardedEngine) findBestRider(homeShardID int, order *model.Order) *mode
 		}
 		innerRadius = outerRadius
 	}
-
+	//homeshard中找不到时，查找相邻shard
 	neighborShardIDs := e.neighborShardIDs(homeShardID)
 	innerRadius = -1
 	for _, outerRadius := range candidateSearchRadii {
@@ -244,11 +252,13 @@ func (e *ShardedEngine) findBestRider(homeShardID int, order *model.Order) *mode
 		}
 		innerRadius = outerRadius
 	}
-
+	//还找不到，查询还没被搜索到的，这里可能会出现相隔十分远还能匹配到的情况，
+	// todo:后续需要优化一下
 	fallbackShardIDs := e.unsearchedShardIDs(homeShardID, neighborShardIDs)
 	return e.bestRiderInShards(fallbackShardIDs, order, -1, 8)
 }
 
+// 对于给出的shards中，在其中搜索与order匹配最佳的rider
 func (e *ShardedEngine) bestRiderInShards(shardIDs []int, order *model.Order, innerRadius int, outerRadius int) *model.Rider {
 	var best *model.Rider
 	scorer := e.shards[0].matcher
@@ -261,6 +271,7 @@ func (e *ShardedEngine) bestRiderInShards(shardIDs []int, order *model.Order, in
 	return best
 }
 
+// 正式调用中已弃用，只用于benchmark与test作为对照组
 func (e *ShardedEngine) findCandidates(homeShardID int, order *model.Order) []matcher.RiderCandidate {
 	homeShardIDs := []int{homeShardID}
 	innerRadius := -1
@@ -298,27 +309,24 @@ func (e *ShardedEngine) neighborShardIDs(homeShardID int) []int {
 	return result
 }
 
+// 已弃用
 func (e *ShardedEngine) collectCandidates(shardIDs []int, order *model.Order, radius int) []matcher.RiderCandidate {
 	candidates := make([]matcher.RiderCandidate, 0)
 
 	for _, shardID := range shardIDs {
 		candidates = append(candidates, e.shards[shardID].matcher.FindNearbyCandidates(order.X, order.Y, radius)...)
-		if e.topK > 0 && len(candidates) >= e.topK {
-			return candidates[:e.topK]
-		}
 	}
 
 	return candidates
 }
 
+// 已弃用
 func (e *ShardedEngine) collectCandidatesInRange(shardIDs []int, order *model.Order, innerRadius int, outerRadius int) []matcher.RiderCandidate {
 	candidates := make([]matcher.RiderCandidate, 0)
 
 	for _, shardID := range shardIDs {
 		candidates = append(candidates, e.shards[shardID].matcher.FindNearbyCandidatesInRange(order.X, order.Y, innerRadius, outerRadius)...)
-		if e.topK > 0 && len(candidates) >= e.topK {
-			return candidates[:e.topK]
-		}
+
 	}
 
 	return candidates

@@ -1,27 +1,28 @@
-package scheduler
+package shard
 
 import "math"
 
-type ShardLayout struct {
-	//整个区域的边长，坐标会按这个范围进行划分
+type Layout struct {
+	// 整个区域的边长，坐标会按这个范围进行划分
 	areaSize int
-	//单个网格单元的边长，用于把区域离散化
+	// 单个网格单元的边长，用于把区域离散化
 	cellSize int
-	//分片总数
+	// 分片总数
 	shardCount int
-	//分片在水平方向上的列数
+	// 分片在水平方向上的列数
 	shardCols int
-	//分片在垂直方向上的行数
+	// 分片在垂直方向上的行数
 	shardRows int
-	//每个轴上所有的网格单元
+	// 每个轴上所有的网格单元
 	cellsPerAxis int
-	//每个分片在 X 方向覆盖的网格数量
+	// 每个分片在 X 方向覆盖的网格数量
 	cellsPerShardX int
-	//每个分片在 Y 方向覆盖的网格数量
+	// 每个分片在 Y 方向覆盖的网格数量
 	cellsPerShardY int
 }
 
-func NewShardLayout(areaSize int, cellSize int, shardCount int) ShardLayout {
+// 根据给定的参数自动转换并生成合适的网格
+func NewLayout(areaSize int, cellSize int, shardCount int) Layout {
 	if areaSize <= 0 {
 		areaSize = 1
 	}
@@ -49,7 +50,7 @@ func NewShardLayout(areaSize int, cellSize int, shardCount int) ShardLayout {
 		cellsPerShardY = 1
 	}
 
-	return ShardLayout{
+	return Layout{
 		areaSize:       areaSize,
 		cellSize:       cellSize,
 		shardCount:     shardCount,
@@ -61,7 +62,8 @@ func NewShardLayout(areaSize int, cellSize int, shardCount int) ShardLayout {
 	}
 }
 
-func (l ShardLayout) ShardID(x int, y int) int {
+// 将坐标化为对应的shard
+func (l Layout) ShardID(x int, y int) int {
 	cellX := clampInt(x/l.cellSize, 0, l.cellsPerAxis-1)
 	cellY := clampInt(y/l.cellSize, 0, l.cellsPerAxis-1)
 
@@ -75,8 +77,8 @@ func (l ShardLayout) ShardID(x int, y int) int {
 	return shardID
 }
 
-// 实际上这个函数会返回自己，因为dx dy可以都取0
-func (l ShardLayout) NeighborShardIDs(shardID int) []int {
+// 求出shard的邻居shard的ID
+func (l Layout) NeighborShardIDs(shardID int) []int {
 	if shardID < 0 || shardID >= l.shardCount {
 		return nil
 	}
@@ -103,23 +105,22 @@ func (l ShardLayout) NeighborShardIDs(shardID int) []int {
 	return ids
 }
 
-func (l ShardLayout) ShardCols() int {
+func (l Layout) ShardCols() int {
 	return l.shardCols
 }
 
-func (l ShardLayout) ShardRows() int {
+func (l Layout) ShardRows() int {
 	return l.shardRows
 }
 
-func (l ShardLayout) CellsPerShardX() int {
+func (l Layout) CellsPerShardX() int {
 	return l.cellsPerShardX
 }
 
-func (l ShardLayout) CellsPerShardY() int {
+func (l Layout) CellsPerShardY() int {
 	return l.cellsPerShardY
 }
 
-// 把value限制在范围内
 func clampInt(value int, minValue int, maxValue int) int {
 	if maxValue < minValue {
 		return minValue

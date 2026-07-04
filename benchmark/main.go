@@ -31,7 +31,6 @@ type Scenario struct {
 
 type Result struct {
 	Scenario     Scenario
-	Engine       string
 	Dynamic      bool
 	Elapsed      time.Duration
 	Matched      int64
@@ -45,10 +44,8 @@ type Result struct {
 func main() {
 	workers := flag.Int("workers", 2, "worker count")
 	profile := flag.String("profile", "default", "default, full, or examples")
-	engineMode := flag.String("engine", "both", "global, sharded, or both")
 	seed := flag.Int64("seed", 1, "random seed")
 	eventsPerBatch := flag.Int("events-per-batch", 3, "rider events applied per order batch in dynamic mode")
-	topK := flag.Int("top-k", 0, "maximum sharded candidates per order; 0 means unlimited")
 	showExamples := flag.Bool("show-examples", false, "print example benchmark scenarios and exit")
 	flag.Parse()
 
@@ -63,28 +60,25 @@ func main() {
 	if *eventsPerBatch < 0 {
 		*eventsPerBatch = 0
 	}
-	if *topK < 0 {
-		*topK = 0
-	}
 
 	runtime.GOMAXPROCS(*workers)
 
 	scenarios := defaultScenarios()
-	if *profile == "examples" {
+	switch *profile {
+	case "examples":
 		scenarios = exampleScenarios()
-	} else if *profile == "full" {
+	case "full":
 		scenarios = fullScenarios()
 	}
 
-	engines := selectedEngines(*engineMode)
-	resultFile, err := createResultFile(*profile, *engineMode, *eventsPerBatch, *topK)
+	resultFile, err := createResultFile(*profile, *eventsPerBatch)
 	if err != nil {
 		panic(err)
 	}
 	defer resultFile.Close()
 
-	header := fmt.Sprintf("workers=%d profile=%s batch=%d events_per_batch=%d engine=%s top_k=%d", *workers, *profile, batchSize, *eventsPerBatch, *engineMode, *topK)
-	columns := "scenario,engine,mode,riders,online_riders,orders,matched,missed,elapsed,throughput,target_elapsed,target_throughput,within_target"
+	header := fmt.Sprintf("workers=%d profile=%s batch=%d events_per_batch=%d engine=sharded", *workers, *profile, batchSize, *eventsPerBatch)
+	columns := "scenario,mode,riders,online_riders,orders,matched,missed,elapsed,throughput,target_elapsed,target_throughput,within_target"
 
 	writeLine(resultFile, header)
 	writeLine(resultFile, columns)
@@ -94,27 +88,14 @@ func main() {
 	for index, scenario := range scenarios {
 		baseSeed := *seed + int64(index)*1000
 
-		for _, engineName := range engines {
-			fixed := runScenario(scenario, engineName, false, *eventsPerBatch, *workers, *topK, baseSeed)
-			printResult(resultFile, fixed)
+		fixed := runScenario(scenario, false, *eventsPerBatch, *workers, baseSeed)
+		printResult(resultFile, fixed)
 
-			dynamic := runScenario(scenario, engineName, true, *eventsPerBatch, *workers, *topK, baseSeed)
-			printResult(resultFile, dynamic)
-		}
+		dynamic := runScenario(scenario, true, *eventsPerBatch, *workers, baseSeed)
+		printResult(resultFile, dynamic)
 	}
 
 	fmt.Printf("result_file=%s\n", resultFile.Name())
-}
-
-func selectedEngines(engineMode string) []string {
-	switch engineMode {
-	case "global":
-		return []string{"global"}
-	case "sharded":
-		return []string{"sharded"}
-	default:
-		return []string{"global", "sharded"}
-	}
 }
 
 func defaultScenarios() []Scenario {
@@ -155,17 +136,17 @@ func printExampleScenarios(scenarios []Scenario) {
 			float64(scenario.OrderCount)/scenario.TargetDuration.Seconds(),
 		)
 	}
-	fmt.Println("run with: go run ./benchmark -profile examples -engine sharded")
+	fmt.Println("run with: go run ./benchmark -profile examples")
 }
 
-func runScenario(scenario Scenario, engineName string, dynamic bool, eventsPerBatch int, workers int, topK int, seed int64) Result {
+func runScenario(scenario Scenario, dynamic bool, eventsPerBatch int, workers int, seed int64) Result {
 	riderRNG := rand.New(rand.NewSource(seed))
 	orderRNG := rand.New(rand.NewSource(seed + 1))
 	eventRNG := rand.New(rand.NewSource(seed + 2))
 
 	riders := generateRiders(riderRNG, scenario.RiderCount, areaSize)
 	cellSize := autoCellSize(areaSize, scenario.RiderCount)
-	e := newEngine(engineName, riders, cellSize, topK)
+	e := newEngine(riders, cellSize)
 
 	e.Start(workers)
 
@@ -177,7 +158,6 @@ func runScenario(scenario Scenario, engineName string, dynamic bool, eventsPerBa
 
 	result := Result{
 		Scenario:     scenario,
-		Engine:       engineName,
 		Dynamic:      dynamic,
 		Elapsed:      elapsed,
 		Matched:      e.Matched(),
@@ -194,20 +174,15 @@ func runScenario(scenario Scenario, engineName string, dynamic bool, eventsPerBa
 	return result
 }
 
-func newEngine(engineName string, riders []*model.Rider, cellSize int, topK int) engine.Engine {
-	if engineName == "sharded" {
-		return engine.NewShardedEngineWithOptions(
-			riders,
-			shardCount,
-			bufferSize,
-			cellSize,
-			areaSize,
-			loadWeight,
-			engine.ShardedOptions{TopK: topK},
-		)
-	}
-
-	return engine.NewGlobalEngine(riders, shardCount, bufferSize, cellSize, areaSize, loadWeight)
+func newEngine(riders []*model.Rider, cellSize int) engine.Engine {
+	return engine.NewShardedEngine(
+		riders,
+		shardCount,
+		bufferSize,
+		cellSize,
+		areaSize,
+		loadWeight,
+	)
 }
 
 func produceOrders(
@@ -406,18 +381,17 @@ func autoCellSize(areaSize int, riderCount int) int {
 	return int(cell)
 }
 
-func createResultFile(profile string, engineMode string, eventsPerBatch int, topK int) (*os.File, error) {
+func createResultFile(profile string, eventsPerBatch int) (*os.File, error) {
 	resultDir := filepath.Join("benchmark", "result")
 	if err := os.MkdirAll(resultDir, 0755); err != nil {
 		return nil, err
 	}
 
 	fileName := fmt.Sprintf(
-		"benchmark_%s_%s_events%d_topk%d_%s.csv",
+		"benchmark_%s_%s_events%d_%s.csv",
 		profile,
-		engineMode,
+		"sharded",
 		eventsPerBatch,
-		topK,
 		time.Now().Format("20060102_150405"),
 	)
 
@@ -435,9 +409,8 @@ func printResult(file *os.File, result Result) {
 	}
 
 	line := fmt.Sprintf(
-		"%s,%s,%s,%d,%d,%d,%d,%d,%s,%.2f,%s,%s,%s\n",
+		"%s,%s,%d,%d,%d,%d,%d,%s,%.2f,%s,%s,%s\n",
 		result.Scenario.Name,
-		result.Engine,
 		mode,
 		result.Scenario.RiderCount,
 		result.OnlineRiders,

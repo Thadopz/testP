@@ -8,6 +8,7 @@ import (
 
 var searchRadii = []int{1, 3, 8}
 
+// 用于匹配订单与骑手，是整个流程中最消耗内存，用时的一部分
 type Matcher struct {
 	grid       *GridIndex
 	loadWeight int64
@@ -22,56 +23,14 @@ func NewMatcher(riders []*model.Rider, cellSize int, loadWeight int64) *Matcher 
 	}
 }
 
-func (m *Matcher) MatchBatch(batch model.OrderBatch) {
-	for i := range batch.Orders {
-		m.MatchOne(&batch.Orders[i])
-	}
-}
-
-func (m *Matcher) MatchShardBatch(batch model.ShardOrderBatch) {
-	for _, orderIndex := range batch.Indexes {
-		m.MatchOne(&batch.Orders[orderIndex])
-	}
-}
-
-func (m *Matcher) MatchOne(order *model.Order) *model.Rider {
-	innerRadius := -1
-
-	for _, outerRadius := range searchRadii {
-		best := m.BestNearbyRiderInRange(order, innerRadius, outerRadius)
-		if best != nil {
-			atomic.AddInt64(&best.Count, 1)
-			m.matched.Add(1)
-			return best
-		}
-		innerRadius = outerRadius
-	}
-
-	m.missed.Add(1)
-	return nil
-}
-
+// 已弃用
 func (m *Matcher) FindNearbyCandidates(x int, y int, radius int) []RiderCandidate {
 	return m.grid.FindNearbyCandidates(x, y, radius)
 }
 
+// 已弃用
 func (m *Matcher) FindNearbyCandidatesInRange(x int, y int, innerRadius int, outerRadius int) []RiderCandidate {
 	return m.grid.FindNearbyCandidatesInRange(x, y, innerRadius, outerRadius)
-}
-
-func (m *Matcher) BestCandidate(order *model.Order, candidates []RiderCandidate) *model.Rider {
-	var best *model.Rider
-	bestScore := int64(math.MaxInt64)
-
-	for _, candidate := range candidates {
-		score := m.score(order, candidate)
-		if score < bestScore {
-			best = candidate.Rider
-			bestScore = score
-		}
-	}
-
-	return best
 }
 
 func (m *Matcher) BestNearbyRiderInRange(order *model.Order, innerRadius int, outerRadius int) *model.Rider {
@@ -90,6 +49,7 @@ func (m *Matcher) BestNearbyRiderInRange(order *model.Order, innerRadius int, ou
 
 	for dx := -outerRadius; dx <= outerRadius; dx++ {
 		for dy := -outerRadius; dy <= outerRadius; dy++ {
+			//在内径中就直接continue，只读外径的
 			if maxInt(absInt(dx), absInt(dy)) <= innerRadius {
 				continue
 			}
@@ -131,43 +91,8 @@ func (m *Matcher) MoveRider(rider *model.Rider) {
 	m.grid.MoveRider(rider)
 }
 
-func (m *Matcher) RemoveRider(rider *model.Rider) {
-	m.grid.RemoveRider(rider)
-}
-
 func (m *Matcher) DeleteRider(rider *model.Rider) {
 	m.grid.DeleteRider(rider)
-}
-
-func (m *Matcher) ApplyRiderEvent(event model.RiderEvent) {
-	rider := &model.Rider{
-		UID: event.UID,
-		X:   event.X,
-		Y:   event.Y,
-	}
-
-	switch event.Type {
-	case model.RiderOnline:
-		m.AddRider(rider)
-	case model.RiderMove:
-		m.MoveRider(rider)
-	case model.RiderOffline:
-		m.RemoveRider(rider)
-	}
-}
-
-func (m *Matcher) OnlineRiders() int {
-	return m.grid.OnlineCount()
-}
-
-func (m *Matcher) score(order *model.Order, candidate RiderCandidate) int64 {
-	dx := int64(order.X - candidate.X)
-	dy := int64(order.Y - candidate.Y)
-	distance := int64(math.Abs(float64(dx)) + math.Abs(float64(dy)))
-	distanceScore := distance / int64(m.grid.cellSize)
-	loadScore := candidate.Count * m.loadWeight
-
-	return distanceScore + loadScore
 }
 
 func (m *Matcher) scoreRider(order *model.Order, rider *model.Rider) int64 {
@@ -175,15 +100,12 @@ func (m *Matcher) scoreRider(order *model.Order, rider *model.Rider) int64 {
 	dy := int64(order.Y - rider.Y)
 	distance := int64(math.Abs(float64(dx)) + math.Abs(float64(dy)))
 	distanceScore := distance / int64(m.grid.cellSize)
+	//原子读Count，避免读时改
 	loadScore := atomic.LoadInt64(&rider.Count) * m.loadWeight
 
 	return distanceScore + loadScore
 }
 
-func (m *Matcher) Matched() int64 {
-	return m.matched.Load()
-}
-
-func (m *Matcher) Missed() int64 {
-	return m.missed.Load()
+func (m *Matcher) OnlineRiders() int {
+	return m.grid.OnlineCount()
 }
