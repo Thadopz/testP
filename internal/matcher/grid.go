@@ -6,8 +6,6 @@ import (
 	"testP/internal/model"
 )
 
-const cellHashWeight = 100000
-
 type RiderCandidate struct {
 	Rider *model.Rider
 	UID   int64
@@ -21,7 +19,7 @@ type GridIndex struct {
 	cellSize int
 	mu       sync.RWMutex
 	riders   map[int64]*model.Rider
-	cells    map[int]map[int64]*model.Rider
+	cells    map[int64]map[int64]*model.Rider
 }
 
 func NewGridIndex(riders []*model.Rider, cellSize int) *GridIndex {
@@ -32,7 +30,7 @@ func NewGridIndex(riders []*model.Rider, cellSize int) *GridIndex {
 	g := &GridIndex{
 		cellSize: cellSize,
 		riders:   make(map[int64]*model.Rider),
-		cells:    make(map[int]map[int64]*model.Rider),
+		cells:    make(map[int64]map[int64]*model.Rider),
 	}
 
 	for _, rider := range riders {
@@ -160,16 +158,15 @@ func (g *GridIndex) OnlineCount() int {
 	return count
 }
 
-func (g *GridIndex) cellID(x, y int) int {
+func (g *GridIndex) cellID(x, y int) int64 {
 	return g.cellIDByCell(x/g.cellSize, y/g.cellSize)
 }
 
-// 将Cell内(x,y)一维化为weight*x+y
-func (g *GridIndex) cellIDByCell(cellX, cellY int) int {
-	return cellHashWeight*cellX + cellY
+func (g *GridIndex) cellIDByCell(cellX, cellY int) int64 {
+	return int64(cellX)<<32 | int64(uint32(cellY))
 }
 
-func (g *GridIndex) addRiderToCell(rider *model.Rider, cellID int) {
+func (g *GridIndex) addRiderToCell(rider *model.Rider, cellID int64) {
 	if g.cells[cellID] == nil {
 		g.cells[cellID] = make(map[int64]*model.Rider)
 	}
@@ -177,7 +174,7 @@ func (g *GridIndex) addRiderToCell(rider *model.Rider, cellID int) {
 }
 
 // 已弃用
-func (g *GridIndex) appendCellCandidates(candidates []RiderCandidate, cellID int) []RiderCandidate {
+func (g *GridIndex) appendCellCandidates(candidates []RiderCandidate, cellID int64) []RiderCandidate {
 	for _, rider := range g.cells[cellID] {
 		candidates = append(candidates, RiderCandidate{
 			Rider: rider,

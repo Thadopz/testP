@@ -65,6 +65,20 @@ func TestFindNearbyCandidatesInRangeEmptyRanges(t *testing.T) {
 	}
 }
 
+func TestCellIDDoesNotCollideAtOldHashBoundary(t *testing.T) {
+	grid := NewGridIndex([]*model.Rider{
+		{UID: 1, X: 0, Y: 100000},
+		{UID: 2, X: 1, Y: 0},
+	}, 1)
+
+	candidates := candidateUIDs(grid.FindNearbyCandidatesInRange(1, 0, -1, 0))
+	want := []int64{2}
+
+	if !reflect.DeepEqual(candidates, want) {
+		t.Fatalf("got candidate UIDs %v, want %v", candidates, want)
+	}
+}
+
 func candidateUIDs(candidates []RiderCandidate) []int64 {
 	uids := make([]int64, 0, len(candidates))
 	for _, candidate := range candidates {

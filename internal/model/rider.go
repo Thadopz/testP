@@ -5,7 +5,7 @@ type Rider struct {
 	X      int
 	Y      int
 	OnLine bool
-	CellID int
+	CellID int64
 	Count  int64
 }
 
