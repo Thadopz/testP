@@ -61,8 +61,89 @@ func TestSubmitBatchCountsOnlyAcceptedOrdersWhenContextCancels(t *testing.T) {
 	}
 }
 
+func TestRiderMoveAcrossShardsUpdatesMatcherIndexes(t *testing.T) {
+	e := NewShardedEngine([]*model.Rider{
+		{UID: 1, X: 0, Y: 0},
+	}, 4, 1, 10, 40, 1000)
+
+	oldShardID := e.layout.ShardID(0, 0)
+	newShardID := e.layout.ShardID(39, 39)
+	oldOrder := &model.Order{ID: 1, X: 0, Y: 0}
+	if got := e.shards[oldShardID].matcher.BestNearbyRiderInRange(oldOrder, -1, 1); got == nil || got.UID != 1 {
+		t.Fatalf("initial match UID = %v, want 1", riderUID(got))
+	}
+
+	e.ApplyRiderEvent(model.RiderEvent{
+		Type: model.RiderMove,
+		UID:  1,
+		X:    39,
+		Y:    39,
+	})
+
+	if got := e.OnlineRiders(); got != 1 {
+		t.Fatalf("online riders = %d, want 1", got)
+	}
+
+	if got := e.shards[oldShardID].matcher.BestNearbyRiderInRange(oldOrder, -1, 1); got != nil {
+		t.Fatalf("old shard match UID = %d, want nil", got.UID)
+	}
+
+	newOrder := &model.Order{ID: 2, X: 39, Y: 39}
+	if got := e.shards[newShardID].matcher.BestNearbyRiderInRange(newOrder, -1, 1); got == nil || got.UID != 1 {
+		t.Fatalf("new shard match UID = %v, want 1", riderUID(got))
+	}
+}
+
+func TestRiderOfflineThenOnlineUpdatesMatcherIndexes(t *testing.T) {
+	e := NewShardedEngine([]*model.Rider{
+		{UID: 1, X: 0, Y: 0},
+	}, 4, 1, 10, 40, 1000)
+
+	oldShardID := e.layout.ShardID(0, 0)
+	oldOrder := &model.Order{ID: 1, X: 0, Y: 0}
+	if got := e.shards[oldShardID].matcher.BestNearbyRiderInRange(oldOrder, -1, 1); got == nil || got.UID != 1 {
+		t.Fatalf("initial match UID = %v, want 1", riderUID(got))
+	}
+
+	e.ApplyRiderEvent(model.RiderEvent{
+		Type: model.RiderOffline,
+		UID:  1,
+	})
+
+	if got := e.OnlineRiders(); got != 0 {
+		t.Fatalf("online riders after offline = %d, want 0", got)
+	}
+	if got := e.shards[oldShardID].matcher.BestNearbyRiderInRange(oldOrder, -1, 1); got != nil {
+		t.Fatalf("offline rider match UID = %d, want nil", got.UID)
+	}
+
+	e.ApplyRiderEvent(model.RiderEvent{
+		Type: model.RiderOnline,
+		UID:  1,
+		X:    39,
+		Y:    39,
+	})
+
+	if got := e.OnlineRiders(); got != 1 {
+		t.Fatalf("online riders after online = %d, want 1", got)
+	}
+
+	newOrder := &model.Order{ID: 2, X: 39, Y: 39}
+	newShardID := e.layout.ShardID(newOrder.X, newOrder.Y)
+	if got := e.shards[newShardID].matcher.BestNearbyRiderInRange(newOrder, -1, 1); got == nil || got.UID != 1 {
+		t.Fatalf("new online match UID = %v, want 1", riderUID(got))
+	}
+}
+
 func newTestShardedEngine(riders []*model.Rider) *ShardedEngine {
 	return NewShardedEngine(riders, 9, 4, 10, 90, 1000)
+}
+
+func riderUID(rider *model.Rider) any {
+	if rider == nil {
+		return nil
+	}
+	return rider.UID
 }
 
 func assertCandidateUIDs(t *testing.T, candidates []matcher.RiderCandidate, want []int64) {
