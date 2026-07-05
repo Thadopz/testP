@@ -1,9 +1,11 @@
 package engine
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"testP/internal/matcher"
 	"testP/internal/model"
@@ -37,6 +39,26 @@ func TestShardedFindCandidatesRemoteShardFallbackHit(t *testing.T) {
 
 	candidates := e.findCandidates(e.layout.ShardID(order.X, order.Y), order)
 	assertCandidateUIDs(t, candidates, []int64{1})
+}
+
+func TestSubmitBatchCountsOnlyAcceptedOrdersWhenContextCancels(t *testing.T) {
+	e := NewShardedEngine(nil, 2, 1, 10, 20, 1000)
+	batch := model.OrderBatch{Orders: []model.Order{
+		{ID: 1, X: 0, Y: 0},
+		{ID: 2, X: 19, Y: 0},
+	}}
+
+	e.shards[1].orderCh <- model.ShardOrderBatch{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	err := e.SubmitBatch(ctx, batch)
+	if err == nil {
+		t.Fatal("got nil error, want context cancellation")
+	}
+	if got := e.Submitted(); got != 1 {
+		t.Fatalf("submitted = %d, want 1", got)
+	}
 }
 
 func newTestShardedEngine(riders []*model.Rider) *ShardedEngine {

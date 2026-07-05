@@ -86,8 +86,6 @@ func (e *ShardedEngine) Start(workerCount int) {
 }
 
 func (e *ShardedEngine) SubmitBatch(ctx context.Context, batch model.OrderBatch) error {
-	e.metrics.Submitted.Add(int64(len(batch.Orders)))
-
 	counts := make([]int, len(e.shards))
 	for _, order := range batch.Orders {
 		shardID := e.layout.ShardID(order.X, order.Y)
@@ -108,6 +106,7 @@ func (e *ShardedEngine) SubmitBatch(ctx context.Context, batch model.OrderBatch)
 		grouped[shardID] = append(grouped[shardID], orderIndex)
 	}
 
+	accepted := 0
 	for shardID, indexes := range grouped {
 		if len(indexes) == 0 {
 			continue
@@ -115,14 +114,21 @@ func (e *ShardedEngine) SubmitBatch(ctx context.Context, batch model.OrderBatch)
 
 		select {
 		case <-ctx.Done():
+			if accepted > 0 {
+				e.metrics.Submitted.Add(int64(accepted))
+			}
 			return ctx.Err()
 		case e.shards[shardID].orderCh <- model.ShardOrderBatch{
 			Orders:  batch.Orders,
 			Indexes: indexes,
 		}:
+			accepted += len(indexes)
 		}
 	}
 
+	if accepted > 0 {
+		e.metrics.Submitted.Add(int64(accepted))
+	}
 	return nil
 }
 
