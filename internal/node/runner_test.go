@@ -24,8 +24,8 @@ func TestRunnerStartsReadingEachShardFromSavedOffset(t *testing.T) {
 	}
 	applier := &fakeApplier{}
 	runner := NewRunner(10, []int{1, 2}, eventLog, applier, nil)
-	runner.NextStep[1] = 5
-	runner.NextStep[2] = 8
+	runner.nextStep[1] = 5
+	runner.nextStep[2] = 8
 
 	err := runner.Run(context.Background())
 	if err != nil {
@@ -62,10 +62,8 @@ func TestRunnerAdvancesOffsetAfterApplySucceeds(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	waitForAppliedEvents(t, applier, 2)
-
-	if runner.NextStep[1] != 2 {
-		t.Fatalf("next offset mismatch: got %d, want %d", runner.NextStep[1], 2)
+	if runner.nextStep[1] != 2 {
+		t.Fatalf("next offset mismatch: got %d, want %d", runner.nextStep[1], 2)
 	}
 }
 
@@ -81,14 +79,12 @@ func TestRunnerDoesNotAdvanceOffsetWhenApplyFails(t *testing.T) {
 	runner := NewRunner(10, []int{1}, eventLog, applier, nil)
 
 	err := runner.Run(context.Background())
-	if err != nil {
-		t.Fatalf("Run returned error: %v", err)
+	if err == nil {
+		t.Fatal("expected Run to return an error")
 	}
 
-	waitForAppliedEvents(t, applier, 1)
-
-	if runner.NextStep[1] != 0 {
-		t.Fatalf("next offset mismatch: got %d, want %d", runner.NextStep[1], 0)
+	if runner.nextStep[1] != 0 {
+		t.Fatalf("next offset mismatch: got %d, want %d", runner.nextStep[1], 0)
 	}
 }
 
@@ -158,7 +154,6 @@ func TestRunnerSavesCheckpointAfterApplySucceeds(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	waitForAppliedEvents(t, applier, 1)
 	waitForCheckpointOffset(t, store, 10, 1, 1)
 }
 

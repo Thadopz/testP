@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testP/internal/checkpoint"
 	"testP/internal/eventlog"
@@ -19,7 +20,7 @@ type Node struct {
 	eventlog eventlog.EventLog
 	applier  eventApplier
 	store    checkpoint.Store
-	NextStep map[int]int64
+	nextStep map[int]int64
 }
 
 func NewRunner(ID int, shards []int, el eventlog.EventLog, ea eventApplier, store checkpoint.Store) *Node {
@@ -32,21 +33,24 @@ func NewRunner(ID int, shards []int, el eventlog.EventLog, ea eventApplier, stor
 		eventlog: el,
 		applier:  ea,
 		store:    store,
-		NextStep: make(map[int]int64),
+		nextStep: make(map[int]int64),
 	}
 }
 
 func (n *Node) Run(ctx context.Context) error {
-	if err := n.loadCheckpoint(ctx); err != nil {
+	errCh := make(chan error, len(n.shardIDs))
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := n.loadCheckpoint(runCtx); err != nil {
 		return err
 	}
 
 	for _, id := range n.shardIDs {
 		n.mu.Lock()
-		nextOffset := n.NextStep[id]
+		nextOffset := n.nextStep[id]
 		n.mu.Unlock()
 
-		eventCh, err := n.eventlog.ReadFrom(ctx, eventlog.Position{
+		eventCh, err := n.eventlog.ReadFrom(runCtx, eventlog.Position{
 			ShardID: id,
 			Offset:  nextOffset,
 		})
@@ -54,42 +58,41 @@ func (n *Node) Run(ctx context.Context) error {
 			return err
 		}
 
-		go n.runShard(ctx, eventCh)
+		go func() {
+			errCh <- n.runShard(runCtx, eventCh)
+		}()
 	}
 
+	for range n.shardIDs {
+		err := <-errCh
+		if err != nil {
+			cancel()
+			return err
+		}
+	}
 	return nil
 }
 
-func (n *Node) runShard(ctx context.Context, eventCh <-chan eventlog.Record) {
+func (n *Node) runShard(ctx context.Context, eventCh <-chan eventlog.Record) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case record, ok := <-eventCh:
 			if !ok {
-				return
+				return nil
 			}
 
 			if n.applier == nil {
-				return
+				return fmt.Errorf("applier not found")
 			}
 
 			if err := n.applier.Apply(ctx, record.Event); err != nil {
-				return
+				return err
 			}
 
-			n.mu.Lock()
-			n.NextStep[record.Position.ShardID] = record.Position.Offset + 1
-			checkpointToSave := checkpoint.Checkpoint{
-				NodeID: n.nodeID,
-				Offset: copyOffsets(n.NextStep),
-			}
-			n.mu.Unlock()
-
-			if n.store != nil {
-				if err := n.store.SaveCheckpoint(ctx, checkpointToSave); err != nil {
-					return
-				}
+			if err := n.advanceCheckpoint(ctx, record.Position); err != nil {
+				return err
 			}
 		}
 	}
@@ -112,10 +115,25 @@ func (n *Node) loadCheckpoint(ctx context.Context) error {
 	defer n.mu.Unlock()
 
 	for shardID, offset := range loaded.Offset {
-		n.NextStep[shardID] = offset
+		n.nextStep[shardID] = offset
 	}
 
 	return nil
+}
+
+func (n *Node) advanceCheckpoint(ctx context.Context, position eventlog.Position) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.nextStep[position.ShardID] = position.Offset + 1
+	if n.store == nil {
+		return nil
+	}
+
+	return n.store.SaveCheckpoint(ctx, checkpoint.Checkpoint{
+		NodeID: n.nodeID,
+		Offset: copyOffsets(n.nextStep),
+	})
 }
 
 func copyOffsets(offsets map[int]int64) map[int]int64 {

@@ -64,7 +64,7 @@ func TestJSONEventCodecPayloadRoundTrip(t *testing.T) {
 		t.Fatalf("DecodePayload returned error: %v", err)
 	}
 
-	expectedOrderID := 1
+	expectedOrderID := int64(1)
 	if decodedPayload.OrderID != expectedOrderID {
 		t.Fatalf("order id mismatch: got %d, want %d", decodedPayload.OrderID, expectedOrderID)
 	}

@@ -53,7 +53,7 @@ func (m *MemoryEventLog) Append(ctx context.Context, event model.Event) (Positio
 
 func (m *MemoryEventLog) ReadFrom(ctx context.Context, position Position) (<-chan Record, error) {
 	m.mu.Lock()
-	RecordCh := make(chan Record)
+
 	if m.records == nil {
 		m.records = make(map[int][]Record)
 	}
@@ -66,6 +66,7 @@ func (m *MemoryEventLog) ReadFrom(ctx context.Context, position Position) (<-cha
 		m.mu.Unlock()
 		return nil, fmt.Errorf("Offset Out of range")
 	}
+	RecordCh := make(chan Record)
 	tmp := slices.Clone(m.records[position.ShardID][position.Offset:])
 	m.mu.Unlock()
 	go func() {
