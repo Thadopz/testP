@@ -21,6 +21,7 @@ type Node struct {
 	applier  eventApplier
 	store    checkpoint.Store
 	nextStep map[int]int64
+	tail     bool
 }
 
 func NewRunner(ID int, shards []int, el eventlog.EventLog, ea eventApplier, store checkpoint.Store) *Node {
@@ -37,6 +38,10 @@ func NewRunner(ID int, shards []int, el eventlog.EventLog, ea eventApplier, stor
 	}
 }
 
+func (n *Node) SetTail(tail bool) {
+	n.tail = tail
+}
+
 func (n *Node) Run(ctx context.Context) error {
 	errCh := make(chan error, len(n.shardIDs))
 	runCtx, cancel := context.WithCancel(ctx)
@@ -50,7 +55,7 @@ func (n *Node) Run(ctx context.Context) error {
 		nextOffset := n.nextStep[id]
 		n.mu.Unlock()
 
-		eventCh, err := n.eventlog.ReadFrom(runCtx, eventlog.Position{
+		eventCh, err := n.openRecordStream(runCtx, eventlog.Position{
 			ShardID: id,
 			Offset:  nextOffset,
 		})
@@ -71,6 +76,19 @@ func (n *Node) Run(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (n *Node) openRecordStream(ctx context.Context, position eventlog.Position) (<-chan eventlog.Record, error) {
+	if !n.tail {
+		return n.eventlog.ReadFrom(ctx, position)
+	}
+
+	tailLog, ok := n.eventlog.(eventlog.TailEventLog)
+	if !ok {
+		return nil, fmt.Errorf("event log does not support tail")
+	}
+
+	return tailLog.TailFrom(ctx, position)
 }
 
 func (n *Node) runShard(ctx context.Context, eventCh <-chan eventlog.Record) error {

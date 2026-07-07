@@ -23,6 +23,11 @@ type EventLog interface {
 	ReadFrom(ctx context.Context, position Position) (<-chan Record, error)
 }
 
+type TailEventLog interface {
+	EventLog
+	TailFrom(ctx context.Context, position Position) (<-chan Record, error)
+}
+
 type MemoryEventLog struct {
 	mu      sync.Mutex
 	records map[int][]Record

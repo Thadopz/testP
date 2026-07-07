@@ -9,21 +9,26 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"testP/internal/cluster"
 	"testP/internal/nodeapp"
 )
+
+const defaultShardCount = 64
 
 func main() {
 	nodeID := flag.Int("node-id", 1, "node id")
 	shardsText := flag.String("shards", "0", "comma-separated shard ids")
+	nodesText := flag.String("nodes", "", "comma-separated node ids for automatic shard ownership")
 	dataDir := flag.String("data-dir", "./data", "data directory")
 	riderCount := flag.Int("riders", 100, "initial rider count")
 	workerCount := flag.Int("workers", 2, "worker count")
 	seed := flag.Int64("seed", 1, "random seed")
+	tail := flag.Bool("tail", false, "keep running and wait for appended events")
 	flag.Parse()
 
-	shardIDs, err := parseShardIDs(*shardsText)
+	shardIDs, err := resolveShardIDs(*nodeID, *shardsText, *nodesText, defaultShardCount)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid -shards: %v\n", err)
+		fmt.Fprintf(os.Stderr, "invalid shard assignment: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -37,6 +42,7 @@ func main() {
 		Riders:   *riderCount,
 		Workers:  *workerCount,
 		Seed:     *seed,
+		Tail:     *tail,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "node failed: %v\n", err)
@@ -79,4 +85,59 @@ func parseShardIDs(text string) ([]int, error) {
 	}
 
 	return shardIDs, nil
+}
+
+func parseNodeIDs(text string) ([]int, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, fmt.Errorf("empty node list")
+	}
+
+	return parsePositiveIDs(text, "node")
+}
+
+func resolveShardIDs(nodeID int, shardsText string, nodesText string, shardCount int) ([]int, error) {
+	if strings.TrimSpace(nodesText) == "" {
+		return parseShardIDs(shardsText)
+	}
+
+	nodeIDs, err := parseNodeIDs(nodesText)
+	if err != nil {
+		return nil, err
+	}
+
+	layout, err := cluster.NewModuloLayout(nodeIDs, shardCount)
+	if err != nil {
+		return nil, err
+	}
+
+	shardIDs := layout.ShardsForNode(nodeID)
+	if len(shardIDs) == 0 {
+		return nil, fmt.Errorf("node %d owns no shards", nodeID)
+	}
+
+	return shardIDs, nil
+}
+
+func parsePositiveIDs(text string, name string) ([]int, error) {
+	parts := strings.Split(text, ",")
+	ids := make([]int, 0, len(parts))
+
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			return nil, fmt.Errorf("empty %s id", name)
+		}
+
+		id, err := strconv.Atoi(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s id %q: %w", name, trimmed, err)
+		}
+		if id <= 0 {
+			return nil, fmt.Errorf("%s id must be > 0: %d", name, id)
+		}
+
+		ids = append(ids, id)
+	}
+
+	return ids, nil
 }

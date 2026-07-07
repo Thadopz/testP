@@ -100,6 +100,43 @@ func TestRunnerReturnsReadFromError(t *testing.T) {
 	}
 }
 
+func TestRunnerTailReturnsErrorWhenEventLogDoesNotSupportTail(t *testing.T) {
+	runner := NewRunner(10, []int{1}, &readOnlyEventLog{}, &fakeApplier{}, nil)
+	runner.SetTail(true)
+
+	err := runner.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected Run to return an error")
+	}
+}
+
+func TestRunnerTailAppliesNewRecordAndStopsOnCancel(t *testing.T) {
+	eventLog := newTailFakeEventLog()
+	applier := &fakeApplier{}
+	store := checkpoint.NewMemoryStore()
+	runner := NewRunner(10, []int{1}, eventLog, applier, store)
+	runner.SetTail(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- runner.Run(ctx)
+	}()
+
+	waitForTailReader(t, eventLog)
+	eventLog.send(testRecord("event-1", 1, 0))
+	waitForAppliedEvents(t, applier, 1)
+	waitForCheckpointOffset(t, store, 10, 1, 1)
+
+	cancel()
+
+	err := <-errCh
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error mismatch: got %v, want %v", err, context.Canceled)
+	}
+}
+
 func TestRunnerLoadsCheckpointBeforeReading(t *testing.T) {
 	eventLog := &fakeEventLog{
 		recordsByShard: map[int][]eventlog.Record{
@@ -157,10 +194,53 @@ func TestRunnerSavesCheckpointAfterApplySucceeds(t *testing.T) {
 	waitForCheckpointOffset(t, store, 10, 1, 1)
 }
 
+type readOnlyEventLog struct{}
+
+func (r *readOnlyEventLog) Append(ctx context.Context, event model.Event) (eventlog.Position, error) {
+	return eventlog.Position{}, nil
+}
+
+func (r *readOnlyEventLog) ReadFrom(ctx context.Context, position eventlog.Position) (<-chan eventlog.Record, error) {
+	recordCh := make(chan eventlog.Record)
+	close(recordCh)
+	return recordCh, nil
+}
+
 type fakeEventLog struct {
 	recordsByShard map[int][]eventlog.Record
 	readPositions  []eventlog.Position
 	err            error
+}
+
+type tailFakeEventLog struct {
+	readyCh  chan struct{}
+	recordCh chan eventlog.Record
+}
+
+func newTailFakeEventLog() *tailFakeEventLog {
+	return &tailFakeEventLog{
+		readyCh:  make(chan struct{}),
+		recordCh: make(chan eventlog.Record),
+	}
+}
+
+func (f *tailFakeEventLog) Append(ctx context.Context, event model.Event) (eventlog.Position, error) {
+	return eventlog.Position{}, nil
+}
+
+func (f *tailFakeEventLog) ReadFrom(ctx context.Context, position eventlog.Position) (<-chan eventlog.Record, error) {
+	recordCh := make(chan eventlog.Record)
+	close(recordCh)
+	return recordCh, nil
+}
+
+func (f *tailFakeEventLog) TailFrom(ctx context.Context, position eventlog.Position) (<-chan eventlog.Record, error) {
+	close(f.readyCh)
+	return f.recordCh, nil
+}
+
+func (f *tailFakeEventLog) send(record eventlog.Record) {
+	f.recordCh <- record
 }
 
 func (f *fakeEventLog) Append(ctx context.Context, event model.Event) (eventlog.Position, error) {
@@ -264,5 +344,15 @@ func waitForCheckpointOffset(t *testing.T, store checkpoint.Store, nodeID int, s
 			t.Fatalf("checkpoint offset mismatch: got found=%v checkpoint=%+v, want shard %d offset %d", found, loaded, shardID, expectedOffset)
 		case <-ticker.C:
 		}
+	}
+}
+
+func waitForTailReader(t *testing.T, eventLog *tailFakeEventLog) {
+	t.Helper()
+
+	select {
+	case <-eventLog.readyCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for tail reader")
 	}
 }

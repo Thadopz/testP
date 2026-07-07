@@ -2,6 +2,7 @@ package nodeapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -29,6 +30,7 @@ type Config struct {
 	Riders   int
 	Workers  int
 	Seed     int64
+	Tail     bool
 }
 
 type Result struct {
@@ -80,9 +82,12 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 	checkpointStore := checkpoint.NewFileStore(checkpointDir)
 	eventApplier := applier.NewEventApplier(codec, matchingEngine)
 	runner := node.NewRunner(cfg.NodeID, cfg.ShardIDs, fileEventLog, eventApplier, checkpointStore)
+	runner.SetTail(cfg.Tail)
 
 	if err := runner.Run(ctx); err != nil {
-		return Result{}, err
+		if !errors.Is(err, context.Canceled) {
+			return Result{}, err
+		}
 	}
 
 	result := Result{

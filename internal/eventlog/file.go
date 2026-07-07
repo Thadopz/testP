@@ -10,12 +10,16 @@ import (
 	"path/filepath"
 	"sync"
 	"testP/internal/model"
+	"time"
 )
 
+const defaultTailPollInterval = 200 * time.Millisecond
+
 type FileEventLog struct {
-	mu    sync.Mutex
-	dir   string
-	codec EventCodec
+	mu           sync.Mutex
+	dir          string
+	codec        EventCodec
+	pollInterval time.Duration
 }
 
 func NewFileEventLog(dir string, codec EventCodec) *FileEventLog {
@@ -24,9 +28,17 @@ func NewFileEventLog(dir string, codec EventCodec) *FileEventLog {
 	}
 
 	return &FileEventLog{
-		dir:   dir,
-		codec: codec,
+		dir:          dir,
+		codec:        codec,
+		pollInterval: defaultTailPollInterval,
 	}
+}
+
+func (l *FileEventLog) SetPollInterval(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	l.pollInterval = interval
 }
 
 func (l *FileEventLog) Append(ctx context.Context, event model.Event) (Position, error) {
@@ -107,6 +119,56 @@ func (l *FileEventLog) ReadFrom(ctx context.Context, position Position) (<-chan 
 	}()
 
 	return recordCh, nil
+}
+
+func (l *FileEventLog) TailFrom(ctx context.Context, position Position) (<-chan Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	recordCh := make(chan Record)
+
+	go func() {
+		defer close(recordCh)
+
+		nextOffset := position.Offset
+		ticker := time.NewTicker(l.pollInterval)
+		defer ticker.Stop()
+
+		for {
+			records, err := l.readRecordsFromPosition(position.ShardID, nextOffset)
+			if err != nil {
+				return
+			}
+
+			for _, record := range records {
+				select {
+				case <-ctx.Done():
+					return
+				case recordCh <- record:
+					nextOffset = record.Position.Offset + 1
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+
+	return recordCh, nil
+}
+
+func (l *FileEventLog) readRecordsFromPosition(shardID int, offset int64) ([]Record, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.readRecordsFromFileLocked(Position{
+		ShardID: shardID,
+		Offset:  offset,
+	})
 }
 
 func (l *FileEventLog) readRecordsFromFileLocked(position Position) ([]Record, error) {
