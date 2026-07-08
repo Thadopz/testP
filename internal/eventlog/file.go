@@ -161,6 +161,21 @@ func (l *FileEventLog) TailFrom(ctx context.Context, position Position) (<-chan 
 	return recordCh, nil
 }
 
+func (l *FileEventLog) EndOffset(ctx context.Context, shardID int) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	offset, err := countLines(l.shardPath(shardID))
+	if err != nil {
+		return 0, fmt.Errorf("count eventlog lines: %w", err)
+	}
+	return offset, nil
+}
+
 func (l *FileEventLog) readRecordsFromPosition(shardID int, offset int64) ([]Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

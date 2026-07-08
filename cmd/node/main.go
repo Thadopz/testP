@@ -2,15 +2,20 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
-	"testP/internal/cluster"
+	"testP/internal/cluster/heartbeat"
+	clusterlayout "testP/internal/cluster/layout"
+	clusterownership "testP/internal/cluster/ownership"
 	"testP/internal/nodeapp"
+	"time"
 )
 
 const defaultShardCount = 64
@@ -24,25 +29,43 @@ func main() {
 	workerCount := flag.Int("workers", 2, "worker count")
 	seed := flag.Int64("seed", 1, "random seed")
 	tail := flag.Bool("tail", false, "keep running and wait for appended events")
+	dynamic := flag.Bool("dynamic", false, "use dynamic shard ownership refresh")
+	heartbeatAddr := flag.String("heartbeat-addr", "", "controller heartbeat RPC address")
+	heartbeatInterval := flag.Duration("heartbeat-interval", time.Second, "heartbeat interval")
 	flag.Parse()
 
-	shardIDs, err := resolveShardIDs(*nodeID, *shardsText, *nodesText, defaultShardCount)
+	ownershipDir := filepath.Join(*dataDir, "ownership")
+	shardIDs, shardProvider, err := resolveShardAssignment(*nodeID, *shardsText, *nodesText, defaultShardCount, *dynamic, ownershipDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid shard assignment: %v\n", err)
+		os.Exit(2)
+	}
+	if *dynamic && !*tail {
+		fmt.Fprintln(os.Stderr, "invalid shard assignment: -dynamic requires -tail")
 		os.Exit(2)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if strings.TrimSpace(*heartbeatAddr) != "" {
+		go func() {
+			err := heartbeat.RunHeartbeatClient(ctx, *heartbeatAddr, *nodeID, *heartbeatInterval)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				fmt.Fprintf(os.Stderr, "heartbeat stopped: %v\n", err)
+			}
+		}()
+	}
+
 	result, err := nodeapp.RunWithResult(ctx, nodeapp.Config{
-		NodeID:   *nodeID,
-		ShardIDs: shardIDs,
-		DataDir:  *dataDir,
-		Riders:   *riderCount,
-		Workers:  *workerCount,
-		Seed:     *seed,
-		Tail:     *tail,
+		NodeID:        *nodeID,
+		ShardIDs:      shardIDs,
+		ShardProvider: shardProvider,
+		DataDir:       *dataDir,
+		Riders:        *riderCount,
+		Workers:       *workerCount,
+		Seed:          *seed,
+		Tail:          *tail,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "node failed: %v\n", err)
@@ -53,10 +76,25 @@ func main() {
 	fmt.Printf("shards: %v\n", result.ShardIDs)
 	fmt.Printf("eventlog_dir: %s\n", result.EventLogDir)
 	fmt.Printf("checkpoint_dir: %s\n", result.CheckpointDir)
+	fmt.Printf("order_state_dir: %s\n", result.OrderStateDir)
+	if *dynamic {
+		fmt.Printf("ownership_dir: %s\n", ownershipDir)
+	}
 	fmt.Printf("submitted: %d\n", result.Submitted)
 	fmt.Printf("matched: %d\n", result.Matched)
 	fmt.Printf("missed: %d\n", result.Missed)
 	fmt.Printf("online_riders: %d\n", result.OnlineRiders)
+	for _, metric := range result.ShardMetrics {
+		fmt.Printf(
+			"shard_metric: shard=%d node=%d epoch=%d checkpoint_offset=%d eventlog_offset=%d lag=%d\n",
+			metric.ShardID,
+			metric.NodeID,
+			metric.Epoch,
+			metric.CheckpointOffset,
+			metric.EventLogOffset,
+			metric.Lag,
+		)
+	}
 }
 
 func parseShardIDs(text string) ([]int, error) {
@@ -96,26 +134,89 @@ func parseNodeIDs(text string) ([]int, error) {
 }
 
 func resolveShardIDs(nodeID int, shardsText string, nodesText string, shardCount int) ([]int, error) {
+	shardIDs, _, err := resolveShardAssignment(nodeID, shardsText, nodesText, shardCount, false, "")
+	return shardIDs, err
+}
+
+func resolveShardAssignment(nodeID int, shardsText string, nodesText string, shardCount int, dynamic bool, ownershipDir string) ([]int, clusterownership.ShardProvider, error) {
 	if strings.TrimSpace(nodesText) == "" {
-		return parseShardIDs(shardsText)
+		if dynamic {
+			store := clusterownership.NewFileOwnershipStore(ownershipDir)
+			ownerships, err := store.ShardsForNode(nodeID)
+			if err != nil {
+				return nil, nil, err
+			}
+			return ownershipsToShardIDs(ownerships), store, nil
+		}
+		shardIDs, err := parseShardIDs(shardsText)
+		return shardIDs, nil, err
 	}
 
 	nodeIDs, err := parseNodeIDs(nodesText)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	layout, err := cluster.NewModuloLayout(nodeIDs, shardCount)
+	layout, err := clusterlayout.NewModuloLayout(nodeIDs, shardCount)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	shardIDs := layout.ShardsForNode(nodeID)
-	if len(shardIDs) == 0 {
-		return nil, fmt.Errorf("node %d owns no shards", nodeID)
+	store := clusterownership.OwnershipStore(clusterownership.NewMemoryOwnershipStore())
+	if dynamic {
+		store = clusterownership.NewFileOwnershipStore(ownershipDir)
 	}
 
-	return shardIDs, nil
+	if err := assignMissingLayout(store, layout); err != nil {
+		return nil, nil, err
+	}
+
+	ownerships, err := store.ShardsForNode(nodeID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	shardIDs := make([]int, 0, len(ownerships))
+	for _, ownership := range ownerships {
+		shardIDs = append(shardIDs, ownership.ShardID)
+	}
+	if len(shardIDs) == 0 && !dynamic {
+		return nil, nil, fmt.Errorf("node %d owns no shards", nodeID)
+	}
+
+	if dynamic {
+		return shardIDs, store, nil
+	}
+
+	return shardIDs, nil, nil
+}
+
+func assignMissingLayout(store clusterownership.OwnershipStore, layout clusterlayout.Layout) error {
+	for _, shardID := range layout.ShardIDs() {
+		if _, ok, err := store.OwnerOf(shardID); err != nil {
+			return err
+		} else if ok {
+			continue
+		}
+
+		nodeID, ok := layout.OwnerOf(shardID)
+		if !ok {
+			return fmt.Errorf("owner for shard %d not found", shardID)
+		}
+		if err := store.Assign(shardID, nodeID); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func ownershipsToShardIDs(ownerships []clusterownership.Ownership) []int {
+	shardIDs := make([]int, 0, len(ownerships))
+	for _, ownership := range ownerships {
+		shardIDs = append(shardIDs, ownership.ShardID)
+	}
+	return shardIDs
 }
 
 func parsePositiveIDs(text string, name string) ([]int, error) {

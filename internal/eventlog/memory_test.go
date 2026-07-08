@@ -3,8 +3,8 @@ package eventlog
 import (
 	"context"
 	"errors"
-	"testing"
 	"testP/internal/model"
+	"testing"
 )
 
 func TestMemoryEventLogAppendAssignsIncreasingOffsets(t *testing.T) {
@@ -75,6 +75,30 @@ func TestMemoryEventLogKeepsShardsSeparate(t *testing.T) {
 
 	if records[0].Event.ID != "shard-1-event" {
 		t.Fatalf("record id mismatch: got %q, want %q", records[0].Event.ID, "shard-1-event")
+	}
+}
+
+func TestMemoryEventLogEndOffsetReturnsNextOffset(t *testing.T) {
+	eventLog := newTestMemoryEventLog(1)
+
+	appendTestEvent(t, eventLog, testEvent("event-1", 1))
+	appendTestEvent(t, eventLog, testEvent("event-2", 1))
+
+	offset, err := eventLog.EndOffset(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("EndOffset returned error: %v", err)
+	}
+	if offset != 2 {
+		t.Fatalf("end offset mismatch: got %d, want 2", offset)
+	}
+}
+
+func TestMemoryEventLogEndOffsetRejectsUnknownShard(t *testing.T) {
+	eventLog := newTestMemoryEventLog(1)
+
+	_, err := eventLog.EndOffset(context.Background(), 99)
+	if err == nil {
+		t.Fatal("expected EndOffset to return an error")
 	}
 }
 

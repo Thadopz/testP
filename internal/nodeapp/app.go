@@ -10,10 +10,13 @@ import (
 	"runtime"
 	"testP/internal/applier"
 	"testP/internal/checkpoint"
+	clusterownership "testP/internal/cluster/ownership"
 	"testP/internal/engine"
 	"testP/internal/eventlog"
 	"testP/internal/model"
 	"testP/internal/node"
+	"testP/internal/orderstate"
+	"time"
 )
 
 const (
@@ -24,13 +27,15 @@ const (
 )
 
 type Config struct {
-	NodeID   int
-	ShardIDs []int
-	DataDir  string
-	Riders   int
-	Workers  int
-	Seed     int64
-	Tail     bool
+	NodeID          int
+	ShardIDs        []int
+	ShardProvider   clusterownership.ShardProvider
+	DataDir         string
+	Riders          int
+	Workers         int
+	Seed            int64
+	Tail            bool
+	RefreshInterval time.Duration
 }
 
 type Result struct {
@@ -38,10 +43,21 @@ type Result struct {
 	ShardIDs      []int
 	EventLogDir   string
 	CheckpointDir string
+	OrderStateDir string
 	Submitted     int64
 	Matched       int64
 	Missed        int64
 	OnlineRiders  int
+	ShardMetrics  []ShardMetric
+}
+
+type ShardMetric struct {
+	ShardID          int
+	NodeID           int
+	Epoch            int64
+	CheckpointOffset int64
+	EventLogOffset   int64
+	Lag              int64
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -59,6 +75,7 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 
 	eventLogDir := filepath.Join(cfg.DataDir, "events")
 	checkpointDir := filepath.Join(cfg.DataDir, "checkpoints")
+	orderStateDir := filepath.Join(cfg.DataDir, "orders")
 
 	cellSize := autoCellSize(defaultAreaSize, cfg.Riders)
 	riders := generateRiders(rand.New(rand.NewSource(cfg.Seed)), cfg.Riders, defaultAreaSize)
@@ -80,8 +97,18 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 	codec := &eventlog.JSONEventCodec{}
 	fileEventLog := eventlog.NewFileEventLog(eventLogDir, codec)
 	checkpointStore := checkpoint.NewFileStore(checkpointDir)
-	eventApplier := applier.NewEventApplier(codec, matchingEngine)
-	runner := node.NewRunner(cfg.NodeID, cfg.ShardIDs, fileEventLog, eventApplier, checkpointStore)
+	orderStateStore := orderstate.NewFileStore(orderStateDir)
+	eventApplier := applier.NewEventApplierWithOrderStore(codec, matchingEngine, orderStateStore)
+	var runner *node.Node
+	if cfg.ShardProvider == nil {
+		runner = node.NewRunner(cfg.NodeID, cfg.ShardIDs, fileEventLog, eventApplier, checkpointStore)
+	} else {
+		if reader, ok := cfg.ShardProvider.(applier.OwnershipReader); ok {
+			eventApplier = applier.NewFencedEventApplierWithOrderStore(codec, matchingEngine, cfg.NodeID, reader, orderStateStore)
+		}
+		runner = node.NewDynamicRunner(cfg.NodeID, cfg.ShardProvider, fileEventLog, eventApplier, checkpointStore)
+		runner.SetRefreshInterval(cfg.RefreshInterval)
+	}
 	runner.SetTail(cfg.Tail)
 
 	if err := runner.Run(ctx); err != nil {
@@ -90,15 +117,31 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 		}
 	}
 
+	shardIDs := append([]int(nil), cfg.ShardIDs...)
+	if cfg.ShardProvider != nil {
+		ownerships, err := cfg.ShardProvider.ShardsForNode(cfg.NodeID)
+		if err != nil {
+			return Result{}, err
+		}
+		shardIDs = ownershipsToShardIDs(ownerships)
+	}
+
+	shardMetrics, err := buildShardMetrics(context.Background(), cfg.NodeID, shardIDs, fileEventLog, checkpointStore, cfg.ShardProvider)
+	if err != nil {
+		return Result{}, err
+	}
+
 	result := Result{
 		NodeID:        cfg.NodeID,
-		ShardIDs:      append([]int(nil), cfg.ShardIDs...),
+		ShardIDs:      shardIDs,
 		EventLogDir:   eventLogDir,
 		CheckpointDir: checkpointDir,
+		OrderStateDir: orderStateDir,
 		Submitted:     matchingEngine.Submitted(),
 		Matched:       matchingEngine.Matched(),
 		Missed:        matchingEngine.Missed(),
 		OnlineRiders:  matchingEngine.OnlineRiders(),
+		ShardMetrics:  shardMetrics,
 	}
 
 	return result, nil
@@ -124,6 +167,12 @@ func withDefaults(cfg Config) Config {
 }
 
 func validateConfig(cfg Config) error {
+	if cfg.ShardProvider != nil && !cfg.Tail {
+		return fmt.Errorf("dynamic shard provider requires tail mode")
+	}
+	if cfg.ShardProvider != nil {
+		return nil
+	}
 	if len(cfg.ShardIDs) == 0 {
 		return fmt.Errorf("at least one shard id is required")
 	}
@@ -133,6 +182,67 @@ func validateConfig(cfg Config) error {
 		}
 	}
 	return nil
+}
+
+func ownershipsToShardIDs(ownerships []clusterownership.Ownership) []int {
+	shardIDs := make([]int, 0, len(ownerships))
+	for _, ownership := range ownerships {
+		shardIDs = append(shardIDs, ownership.ShardID)
+	}
+	return shardIDs
+}
+
+func buildShardMetrics(
+	ctx context.Context,
+	nodeID int,
+	shardIDs []int,
+	offsetReader eventlog.OffsetReader,
+	checkpointStore checkpoint.Store,
+	shardProvider clusterownership.ShardProvider,
+) ([]ShardMetric, error) {
+	loadedCheckpoint, found, err := checkpointStore.LoadCheckpoint(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	checkpointOffsets := map[int]int64{}
+	if found {
+		checkpointOffsets = loadedCheckpoint.Offset
+	}
+
+	epochs := make(map[int]int64)
+	if shardProvider != nil {
+		ownerships, err := shardProvider.ShardsForNode(nodeID)
+		if err != nil {
+			return nil, err
+		}
+		for _, currentOwnership := range ownerships {
+			epochs[currentOwnership.ShardID] = currentOwnership.Epoch
+		}
+	}
+
+	metrics := make([]ShardMetric, 0, len(shardIDs))
+	for _, shardID := range shardIDs {
+		checkpointOffset := checkpointOffsets[shardID]
+		eventLogOffset, err := offsetReader.EndOffset(ctx, shardID)
+		if err != nil {
+			return nil, err
+		}
+		lag := eventLogOffset - checkpointOffset
+		if lag < 0 {
+			lag = 0
+		}
+
+		metrics = append(metrics, ShardMetric{
+			ShardID:          shardID,
+			NodeID:           nodeID,
+			Epoch:            epochs[shardID],
+			CheckpointOffset: checkpointOffset,
+			EventLogOffset:   eventLogOffset,
+			Lag:              lag,
+		})
+	}
+
+	return metrics, nil
 }
 
 func generateRiders(rng *rand.Rand, count int, areaSize int) []*model.Rider {

@@ -79,6 +79,33 @@ func TestFileEventLogKeepsShardsSeparate(t *testing.T) {
 	}
 }
 
+func TestFileEventLogEndOffsetReturnsNextOffset(t *testing.T) {
+	eventLog := NewFileEventLog(t.TempDir(), &JSONEventCodec{})
+
+	appendFileTestEvent(t, eventLog, testEvent("event-1", 1))
+	appendFileTestEvent(t, eventLog, testEvent("event-2", 1))
+
+	offset, err := eventLog.EndOffset(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("EndOffset returned error: %v", err)
+	}
+	if offset != 2 {
+		t.Fatalf("end offset mismatch: got %d, want 2", offset)
+	}
+}
+
+func TestFileEventLogEndOffsetReturnsZeroForMissingShard(t *testing.T) {
+	eventLog := NewFileEventLog(t.TempDir(), &JSONEventCodec{})
+
+	offset, err := eventLog.EndOffset(context.Background(), 99)
+	if err != nil {
+		t.Fatalf("EndOffset returned error: %v", err)
+	}
+	if offset != 0 {
+		t.Fatalf("end offset mismatch: got %d, want 0", offset)
+	}
+}
+
 func TestFileEventLogReadFromMissingShardReturnsEmptyChannel(t *testing.T) {
 	eventLog := NewFileEventLog(t.TempDir(), &JSONEventCodec{})
 

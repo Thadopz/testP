@@ -28,9 +28,30 @@ type TailEventLog interface {
 	TailFrom(ctx context.Context, position Position) (<-chan Record, error)
 }
 
+type OffsetReader interface {
+	EndOffset(ctx context.Context, shardID int) (int64, error)
+}
+
 type MemoryEventLog struct {
 	mu      sync.Mutex
 	records map[int][]Record
+}
+
+func (m *MemoryEventLog) EndOffset(ctx context.Context, shardID int) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if m.records == nil {
+		m.records = make(map[int][]Record)
+	}
+	records, ok := m.records[shardID]
+	if !ok {
+		return 0, fmt.Errorf("Shard Not Found")
+	}
+	return int64(len(records)), nil
 }
 
 func (m *MemoryEventLog) Append(ctx context.Context, event model.Event) (Position, error) {
