@@ -1,246 +1,250 @@
-# Program Design Test: Order Matching Benchmark
+# Program Design Test: Order Matching Distribution 
 
-这是一个用 Go 编写的订单与骑手匹配模拟项目，用于验证在不同骑手规模、订单规模和运行时长约束下，系统能否持续生成订单并完成分配。
+这是一个用 Go 编写的订单与骑手匹配模拟项目,用于验证在不同骑手规模、订单规模和运行时长约束下，系统能否持续生成订单并完成分配。
 
-项目采用批量流式模拟的方式：订单分批生成，生成后立即进入调度和匹配流程，同时支持骑手移动、上线、下线等动态事件，初步地模拟骑手行为。经过了七次优化，在2核4GB的云主机上，对于最慢的场景（一万骑手对应 100 万订单）的时间从大于40秒降低至约1.8秒，其中有0.7秒用于尽快地生成批量订单（大约55w单每秒），实际处理时间约1.1秒。
+项目从先前的单机订单匹配 benchmark出发，在分布式方向上进行了拓展事件日志、分片拥有权、持久化、节点故障切换、epoch屏障和可观测指标等等的功能。
+
+其中核心逻辑先由我个人手写实现，AI参与了后续优化工作，主要内容如下
+
+- 设计事件字段Event、事件日志EventLog
+- 拥有权ownership、持久化checkpoint、存活检测membership：
+  - ownership是一个三元组(shard, node, epoch)，表示某个shard由哪个node在当前epoch拥有
+  - checkpoint记录了某一时刻下日志的Offset，epoch以及shard-node对，表示某个shard已经处理到哪个事件位置
+  - membership是一个接口，定义了检验节点是否存活的动作
+- 划分node，controller职责：
+  - controller负责维护shard ownership，节点心跳失效后重新分配shard
+  - node负责消费自己持有的shard并应用事件
+- 节点保活：
+
+  - 节点故障后让shard进行迁移，但是对于已经执行了操作后在持久化保存时宕机的情况，不加入DB事务锁可能会在其他node接手后进行重复操作，后面设计了orderState给正在进行持久化动作时标记node状态为pending，但是意识到就算如此也要考虑标记过程是否也会宕机，可能这个问题不使用事务很难去进行一个完全的处理
+- 事件应用前后使用fencing校验，防止脏写入：具体而言就是维护一个版本号epoch，更新shard归属时就会自增，类似CAS的思路
+- Controller的一部分高可用能力
+
+  - 通过etcd的租约以及事务锁，保证唯一leader的存在，在接入etcd前手动写了一个raft的简单实现，第二天起来给节点接入etcd时忘记这回事了，重新写的时候又觉得我直接用etcd不就好了...
+- 节点负载均衡
+  - 使用一致性哈希分配shard，默认一个node在哈希环上有32份，不过因为shard太少(64个)可能会导致分布效果有点平庸。
+  - 通过controller更改shard的所属者，当node中的refreshOnce检测到shard归属变化时将其从自己的map中移除并执行context.Cancel，而node的执行层中设置了两层fence隔离，这里会有三种情况，1是在第一层fence前检测到归属变化，安全退出，2是在通过第一层后执行操作时变动，已经发生了操作，但是不会推进到持久化保存，3是正在发生操作，会因为收到Ctx.Done而取消操作
+  
+
+主要写了事件从生成到分配到对应节点处理的整个流程并从内存态实现转移到文件态实现，最后调用中间件完成最终实现。（由于先抽出接口写了内存实现和文件实现来验证能不能跑起来，所以项目中存在不少懒加载默认是加载内存或者文件实现）
+
+其中AI给出了一部分修改意见并且对项目进行了重构与测试，全程接管了测试、指标收集和可观测性的构造
+
+后面逐步替换为中间件实现，比如使用Kafka作为事件日志，etcd作为分布式协调和持久化存储，顺便用来做控制器的选举制度，目前还处于一个接口多种实现的中间态，使用Prometheus/Grafana作为可观测指标和告警（这部分是AI构造的）。
+
+## 当前能力
+
+- 使用 Kafka 作为订单事件日志。
+- 使用 etcd 保存节点 membership、shard ownership、controller election、checkpoint 和 order state。
+- node 按当前 ownership 动态消费自己负责的 shard。
+- controller 通过 leader election 保证同一时间只有一个 active controller 做 ownership 维护。
+- node 心跳失效后，controller 会把 dead node 的 shard 迁移给存活节点。
+- ownership 带 epoch，applier 会做 fencing 校验，避免旧 owner 在恢复后继续写入过期状态。
+- checkpoint 在事件成功 apply 后推进，整体语义接近 at-least-once。
+- 暴露 Prometheus 指标，并提供 Grafana dashboard。
+
+## 核心流程
+
+1. `cmd/producer` 生成 `order_created` 事件并写入 Kafka。
+2. `cmd/controller` 竞选 leader，读取 etcd 中的节点 membership，并维护 shard 到 node 的 ownership。
+3. `cmd/node` 定期写入心跳，读取自己持有的 shard ownership。
+4. node 从 Kafka 按 shard 读取事件，从 etcd shard checkpoint 继续处理。
+5. event applier 在 apply 前校验 ownership epoch，过期 owner 会被拒绝。
+6. apply 成功后，node 写入 order state，并推进该 shard 的 checkpoint。
+7. 如果某个 node 心跳过期，controller 会把它持有的 shard 重新分配给其他 alive node。
 
 ## 目录结构
 
 ```text
-.
-├── main.go                         # 长期实际运行入口
-├── benchmark/main.go               # 多场景 benchmark 入口
-├── internal/engine                 # sharded 引擎实现
-├── internal/matcher                # 网格索引与骑手匹配逻辑
-├── internal/model                  # 订单、骑手、事件模型
-└── internal/shard                  # 分片布局
+cmd/
+  controller/       controller CLI，主要负责参数解析
+  node/             node CLI，启动心跳、runner和metrics
+  producer/         producer CLI，向Kafka写入订单事件
+internal/
+  applier/          event -> engine/order state/checkpoint 的应用逻辑
+  checkpoint/       shard checkpoint 存储
+  cluster/          election、membership、ownership、failover 等集群协调逻辑
+  controllerapp/    controller 运行时组装
+  engine/           分片订单匹配引擎
+  eventlog/         Kafka event log 与事件 codec
+  matcher/          骑手匹配与空间索引
+  metrics/          Prometheus 指标
+  node/             runner 与 shard 消费逻辑
+  nodeapp/          node 运行时组装
+  orderstate/       order state 存储
+  producerapp/      producer 运行时组装
+  shard/            shard layout
+  tools/            测试与工具函数
+observability/      Prometheus、Grafana、告警规则
+scripts/            本地 e2e 与 Kafka 辅助脚本
 ```
 
 ## 环境要求
 
-```text
-Go 1.25.3+
+- Go 1.25+
+- Docker Desktop
+- PowerShell
+
+本地分布式链路默认依赖 Docker Compose 启动 Kafka、etcd、Prometheus 和 Grafana。
+
+## 快速运行
+
+启动中间件和观测组件：
+
+```powershell
+docker compose up -d
 ```
 
-本项目无第三方依赖。
+创建 Kafka topic：
 
-## 运行测试
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\kafka_create_topic.ps1 -Topic order-events -Partitions 64
+```
 
-```bash
+启动一个 node：
+
+```powershell
+go run ./cmd/node -node-id 1 -metrics-addr :9101
+```
+
+启动 controller：
+
+```powershell
+go run ./cmd/controller -metrics-addr :9102
+```
+
+写入一批订单事件：
+
+```powershell
+go run ./cmd/producer -orders 100 -metrics-addr :9103
+```
+
+默认地址：
+
+```text
+Kafka:      127.0.0.1:9092
+etcd:       127.0.0.1:2379
+etcd prefix /testp
+topic:      order-events
+```
+
+## 观测
+
+Prometheus:
+
+```text
+http://localhost:9090
+```
+
+Grafana:
+
+```text
+http://localhost:3000
+```
+
+Grafana dashboard 会通过 provisioning 自动加载。Prometheus 默认抓取：
+
+```text
+node:       host.docker.internal:9101
+controller: host.docker.internal:9102
+producer:   host.docker.internal:9103
+```
+
+需要注意：producer 当前是短生命周期进程，如果运行太快结束，Prometheus 可能来不及抓到它的指标。
+
+## 故障转移演示
+
+先启动两个 node，注意第二个 node 使用不同的 metrics 端口：
+
+```powershell
+go run ./cmd/node -node-id 1 -metrics-addr :9101
+go run ./cmd/node -node-id 2 -metrics-addr :9104
+```
+
+再启动 controller：
+
+```powershell
+go run ./cmd/controller -metrics-addr :9102
+```
+
+停止 node 1 后，等待 membership TTL 和 controller sweep 生效。controller 会识别 node 1 已失效，并把它持有的 shard 分配给仍然 alive 的 node。
+
+如果想用脚本跑一轮本地验证，可以参考：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\e2e_failover.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\e2e_kafka_eventlog.ps1
+```
+
+## 常用参数
+
+`cmd/node`：
+
+```text
+-node-id              node id，默认 1
+-data-dir             本地数据目录，默认 ./data
+-riders               初始骑手数量，默认 100
+-workers              engine worker 数量，默认 2
+-seed                 随机种子，默认 1
+-heartbeat-interval   心跳间隔，默认 1s
+-membership-ttl       membership TTL，默认 5s
+-metrics-interval     控制台指标打印间隔，默认 5s
+-metrics-addr         Prometheus 地址，默认 :9101
+-etcd-endpoints       etcd 地址，默认 127.0.0.1:2379
+-etcd-prefix          etcd key 前缀，默认 /testp
+-kafka-brokers        Kafka broker，默认 127.0.0.1:9092
+-kafka-topic          Kafka topic，默认 order-events
+```
+
+`cmd/controller`：
+
+```text
+-controller-id        controller election id，默认 hostname-pid
+-etcd-endpoints       etcd 地址，默认 127.0.0.1:2379
+-etcd-prefix          etcd key 前缀，默认 /testp
+-election-ttl         controller election TTL，默认 5s
+-membership-ttl       membership TTL，默认 5s
+-sweep-interval       dead node 扫描间隔，默认 1s
+-shards               shard 数量，默认 64
+-metrics-addr         Prometheus 地址，默认 :9102
+```
+
+`cmd/producer`：
+
+```text
+-orders               写入订单数，默认 100
+-start-id             起始订单 ID，默认 1
+-seed                 随机种子，默认 1
+-metrics-addr         Prometheus 地址，默认 :9103
+-kafka-brokers        Kafka broker，默认 127.0.0.1:9092
+-kafka-topic          Kafka topic，默认 order-events
+```
+
+## 测试
+
+运行全部测试：
+
+```powershell
 go test ./...
 ```
 
-运行标准 Go benchmark：
+如果本机并发或 vet 环境不稳定，可以用更保守的方式：
 
-```bash
-go test ./internal/... -run '^$' -bench . -benchmem
+```powershell
+$env:GOFLAGS='-p=1'
+go test -vet=off ./...
 ```
 
+校验 Prometheus 配置和告警规则：
 
-## 实际运行
-
-默认运行会持续生成订单和骑手事件，直到手动停止：
-
-```bash
-go run .
+```powershell
+docker run --rm --entrypoint promtool -v "${PWD}\observability:/etc/prometheus:ro" prom/prometheus:v2.55.1 check config /etc/prometheus/prometheus.yml
+docker run --rm --entrypoint promtool -v "${PWD}\observability:/etc/prometheus:ro" prom/prometheus:v2.55.1 check rules /etc/prometheus/alerts.yml
 ```
 
-运行 60 秒：
+## 设计边界
 
-```bash
-go run . -workers 2 -run-for 60s
-```
-
-常用参数：
-
-```text
--riders     初始骑手数，默认 100
--workers    worker 数，默认 2
--run-for    运行时长，0s 表示一直运行，默认0s
--seed       随机种子，默认 1
-```
-
-注意：`main.go` 中的订单生成有随机等待：
-
-```text
-每批订单数：1-50
-每批等待：10ms-50ms
-```
-
-因此默认 60 秒运行更像真实流量模拟，不是机器极限压测。默认配置下理论生成速率约为 850 orders/s。
-
-## Benchmark 场景
-
-运行项目级 benchmark：
-
-```bash
-go run ./benchmark -workers 2 -profile default
-```
-
-可选 profile：
-
-```text
-default    跑 100/1000/10000 骑手规模的默认场景
-examples   跑带目标时长的示例场景
-full       额外包含 10 万骑手、1000 万订单的大规模场景
-```
-
-查看目标场景示例：
-
-```bash
-go run ./benchmark -show-examples
-```
-
-示例目标场景的语义是多组独立测试：
-
-```text
-1 分钟内：1000 个骑手，对应 10 万订单
-3 分钟内：10000 个骑手，对应 100 万订单
-10 分钟内：100000 个骑手，对应 1000 万订单
-```
-
-每个场景内部为流水线式的批量模拟。
-
-带目标时长的场景会按目标吞吐匀速投递订单；没有目标时长的 default/full 场景仍按满压方式尽快提交订单。
-
-## 结果指标
-
-benchmark 输出字段：
-
-```text
-scenario           场景名称
-mode               fixed 或 dynamic，dynamic 会插入骑手事件
-riders             初始骑手数
-online_riders      结束时在线骑手数
-orders             订单数
-matched            成功匹配订单数
-missed             未匹配订单数
-submit_elapsed     订单生成、分批提交和动态骑手事件注入耗时
-drain_elapsed      停止提交后等待 worker 处理完队列的耗时
-elapsed            总耗时
-throughput         吞吐，orders/s
-target_elapsed     目标耗时，仅 examples profile 有值
-target_throughput  目标吞吐，仅 examples profile 有值
-within_target      是否在目标耗时内完成
-```
-
-## 2 核 4G 实测数据
-
-测试环境：
-
-```text
-云主机：Azure Linux VM
-CPU：2 vCPU，Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-内存：约 3.8 GiB
-系统：Ubuntu 22.04 Azure kernel
-worker：2
-```
-
-### 项目级 Benchmark
-
-命令：
-
-```bash
-../bin/testP_benchmark -workers 2 -profile default
-```
-
-结果：
-
-```text
-workers=2 profile=default batch=5000 events_per_batch=3 engine=sharded
-wall_time=0:03.73 max_rss_kb=50760
-```
-
-| 场景 | 模式 | 骑手数 | 在线骑手 | 订单数 | 匹配数 | miss | 提交耗时 | 排空耗时 | 总耗时 | 吞吐 orders/s |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100r_1w_orders | fixed | 100 | 100 | 10000 | 10000 | 0 | 966.211µs | 3.932074ms | 4.898423ms | 2041473.35 |
-| 100r_1w_orders | dynamic | 100 | 98 | 10000 | 10000 | 0 | 807.055µs | 3.735201ms | 4.542399ms | 2201479.88 |
-| 1000r_10w_orders | fixed | 1000 | 1000 | 100000 | 100000 | 0 | 9.449717ms | 40.961777ms | 50.411715ms | 1983665.90 |
-| 1000r_10w_orders | dynamic | 1000 | 995 | 100000 | 100000 | 0 | 8.465909ms | 42.222063ms | 50.688221ms | 1972844.93 |
-| 1w_r_100w_orders | fixed | 10000 | 10000 | 1000000 | 1000000 | 0 | 696.956045ms | 1.104413728s | 1.801369981s | 555133.04 |
-| 1w_r_100w_orders | dynamic | 10000 | 9998 | 1000000 | 1000000 | 0 | 701.15445ms | 1.111083887s | 1.812238527s | 551803.74 |
-
-### 标准 Go Benchmark
-
-命令：
-
-```bash
-../bin/engine.test -test.run='^$' -test.bench=. -test.benchtime=1s -test.cpu=2
-../bin/matcher.test -test.run='^$' -test.bench=. -test.benchtime=1s -test.cpu=2
-../bin/shard.test -test.run='^$' -test.bench=. -test.benchtime=1s -test.cpu=2
-```
-
-结果：
-
-```text
-== engine ==
-goos: linux
-goarch: amd64
-pkg: testP/internal/engine
-cpu: Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-BenchmarkNewShardedEngine-2                         	     375	   3144095 ns/op	 2845648 B/op	    5517 allocs/op
-BenchmarkShardedSubmitBatchRouting-2                	   29037	     41195 ns/op	   10760 B/op	      66 allocs/op
-BenchmarkShardedFindCandidatesHomeShard-2           	  120988	      9864 ns/op	   16941 B/op	       9 allocs/op
-BenchmarkShardedCollectCandidatesNeighborShards-2   	   15620	     76844 ns/op	  125920 B/op	      30 allocs/op
-BenchmarkShardedMatchOne-2                          	  623016	      1903 ns/op	       0 B/op	       0 allocs/op
-BenchmarkShardedApplyRiderMoveSameShard-2           	18259306	        65.62 ns/op	       0 B/op	       0 allocs/op
-BenchmarkShardedApplyRiderMoveCrossShard-2          	 6890396	       173.6 ns/op	       0 B/op	       0 allocs/op
-PASS
-== matcher ==
-goos: linux
-goarch: amd64
-pkg: testP/internal/matcher
-cpu: Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-BenchmarkGridFindNearbyCandidatesRadius1-2     	   90231	     13317 ns/op	   21746 B/op	       8 allocs/op
-BenchmarkGridFindNearbyCandidatesRadius3-2     	   22497	     53796 ns/op	   81001 B/op	      10 allocs/op
-BenchmarkGridFindNearbyCandidatesRadius8-2     	    3169	    396131 ns/op	  586359 B/op	      15 allocs/op
-BenchmarkGridFindNearbyCandidatesRange0To1-2   	   88975	     13329 ns/op	   21745 B/op	       8 allocs/op
-BenchmarkGridFindNearbyCandidatesRange2To3-2   	   25101	     47475 ns/op	   74509 B/op	      10 allocs/op
-BenchmarkGridFindNearbyCandidatesRange4To8-2   	    4196	    287475 ns/op	  432840 B/op	      14 allocs/op
-BenchmarkGridMoveRider-2                       	11253118	       105.9 ns/op	       0 B/op	       0 allocs/op
-PASS
-== shard ==
-goos: linux
-goarch: amd64
-pkg: testP/internal/shard
-cpu: Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-BenchmarkShardLayoutShardID-2            	99360358	        11.80 ns/op	       0 B/op	       0 allocs/op
-BenchmarkShardLayoutNeighborShardIDs-2   	25573957	        46.09 ns/op	      80 B/op	       1 allocs/op
-PASS
-```
-
-### 60 秒实际运行
-
-命令：
-
-```bash
-../bin/testP_app -workers 2 -run-for 60s
-```
-
-结果：
-
-```text
-riders: 100
-online_riders: 97
-orders: 50392
-matched: 50392
-missed: 0
-workers: 2
-shards: 64
-shard_layout: 8x8
-cell_size: 44721
-elapsed: 1m0.000011031s
-throughput: 839.87 orders/s
-bottom riders:
-uid=55 count=316
-uid=85 count=410
-uid=2 count=450
-uid=5 count=450
-uid=12 count=450
-uid=18 count=450
-uid=24 count=450
-uid=25 count=450
-uid=29 count=450
-uid=39 count=450
-wall_time=1:00.00 max_rss_kb=8788
-```
+- Kafka/etcd 都是本地单实例配置，不具备生产级高可用。
+- producer 是批量写入，不是长期运行的服务。
+- order state 仍是简化模型。
+- benchmark 暂时后置，后续再补吞吐、延迟、failover 恢复时间等指标。
