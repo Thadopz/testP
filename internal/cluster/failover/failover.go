@@ -2,6 +2,7 @@ package failover
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"testP/internal/cluster/membership"
 	"testP/internal/cluster/ownership"
@@ -61,6 +62,58 @@ func (f *FailoverController) FailoverDeadNode(deadNodeID int) error {
 	}
 
 	return nil
+}
+
+func (f *FailoverController) FailoverMissingOwners() ([]int, error) {
+	if f.ownership == nil {
+		return nil, fmt.Errorf("ownership store is required")
+	}
+	if f.membership == nil {
+		return nil, fmt.Errorf("membership store is required")
+	}
+
+	lister, ok := f.ownership.(ownership.OwnershipLister)
+	if !ok {
+		return nil, fmt.Errorf("ownership store cannot list all ownerships")
+	}
+
+	allOwnerships, err := lister.AllOwnerships()
+	if err != nil {
+		return nil, err
+	}
+	if len(allOwnerships) == 0 {
+		return nil, nil
+	}
+
+	aliveNodes, err := f.membership.AliveNodes()
+	if err != nil {
+		return nil, err
+	}
+	aliveSet := make(map[int]bool, len(aliveNodes))
+	for _, nodeID := range aliveNodes {
+		aliveSet[nodeID] = true
+	}
+
+	deadSet := make(map[int]bool)
+	for _, ownership := range allOwnerships {
+		if !aliveSet[ownership.NodeID] {
+			deadSet[ownership.NodeID] = true
+		}
+	}
+
+	deadNodeIDs := make([]int, 0, len(deadSet))
+	for nodeID := range deadSet {
+		deadNodeIDs = append(deadNodeIDs, nodeID)
+	}
+	sort.Ints(deadNodeIDs)
+
+	for _, nodeID := range deadNodeIDs {
+		if err := f.FailoverDeadNode(nodeID); err != nil {
+			return deadNodeIDs, err
+		}
+	}
+
+	return deadNodeIDs, nil
 }
 
 func removeNodeID(nodeIDs []int, removedNodeID int) []int {

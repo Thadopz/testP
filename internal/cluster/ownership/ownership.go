@@ -16,6 +16,10 @@ type OwnershipStore interface {
 	Assign(shardID int, nodeID int) error
 }
 
+type OwnershipLister interface {
+	AllOwnerships() ([]Ownership, error)
+}
+
 type ShardProvider interface {
 	ShardsForNode(nodeID int) ([]Ownership, error)
 }
