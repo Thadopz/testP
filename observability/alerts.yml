@@ -1,0 +1,83 @@
+groups:
+  - name: testp-cluster
+    rules:
+      - alert: TestPControllerNoLeader
+        expr: max(testp_controller_leader) < 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: TestP controller has no active leader
+          description: No controller has reported leader=1 for at least 30 seconds.
+
+      - alert: TestPNodeMetricsDown
+        expr: up{job="testp-node"} == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: TestP node metrics endpoint is down
+          description: Prometheus cannot scrape a node metrics endpoint.
+
+      - alert: TestPControllerMetricsDown
+        expr: up{job="testp-controller"} == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: TestP controller metrics endpoint is down
+          description: Prometheus cannot scrape a controller metrics endpoint.
+
+      - alert: TestPShardLagHigh
+        expr: testp_shard_lag > 100
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: TestP shard lag is high
+          description: Node {{ $labels.node_id }} shard {{ $labels.shard_id }} lag is {{ $value }}.
+
+      - alert: TestPApplyErrorsIncreasing
+        expr: increase(testp_event_apply_errors_total[1m]) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: TestP event apply errors are increasing
+          description: Node {{ $labels.node_id }} shard {{ $labels.shard_id }} event {{ $labels.event_type }} has apply errors.
+
+      - alert: TestPFencingRejectsIncreasing
+        expr: increase(testp_fencing_reject_total[1m]) > 0
+        for: 30s
+        labels:
+          severity: info
+        annotations:
+          summary: TestP fencing rejects are increasing
+          description: Node {{ $labels.node_id }} shard {{ $labels.shard_id }} has ownership fencing rejects.
+
+      - alert: TestPProducerErrorsIncreasing
+        expr: increase(testp_producer_errors_total[1m]) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: TestP producer errors are increasing
+          description: Producer error reason {{ $labels.reason }} is increasing.
+
+      - alert: TestPControllerSweepErrorsIncreasing
+        expr: increase(testp_controller_sweep_errors_total[1m]) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: TestP controller sweep errors are increasing
+          description: Controller {{ $labels.controller_id }} sweep error reason {{ $labels.reason }} is increasing.
+
+      - alert: TestPShardsWithoutOwner
+        expr: testp_shards_without_owner > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: TestP has shards without owners
+          description: Controller {{ $labels.controller_id }} reports {{ $value }} shards without owners.
