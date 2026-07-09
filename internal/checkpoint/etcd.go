@@ -7,8 +7,9 @@ import (
 	"fmt"
 	"path"
 	"strconv"
-	"strings"
 	"time"
+
+	"testP/internal/tools"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -27,7 +28,7 @@ type EtcdStore struct {
 func NewEtcdStore(client *clientv3.Client, prefix string) *EtcdStore {
 	return &EtcdStore{
 		client:  client,
-		prefix:  cleanEtcdPrefix(prefix),
+		prefix:  tools.CleanEtcdPrefix(prefix),
 		timeout: defaultEtcdCheckpointTimeout,
 	}
 }
@@ -173,15 +174,4 @@ func (s *EtcdStore) shardCheckpointKey(shardID int) string {
 
 func (s *EtcdStore) shardCheckpointPrefix() string {
 	return path.Join(s.prefix, "checkpoints", "shards") + "/"
-}
-
-func cleanEtcdPrefix(prefix string) string {
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		return "/testp"
-	}
-	if !strings.HasPrefix(prefix, "/") {
-		prefix = "/" + prefix
-	}
-	return path.Clean(prefix)
 }

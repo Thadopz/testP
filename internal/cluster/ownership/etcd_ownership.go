@@ -8,8 +8,9 @@ import (
 	"path"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
+
+	"testP/internal/tools"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -26,7 +27,7 @@ type EtcdOwnershipStore struct {
 func NewEtcdOwnershipStore(client *clientv3.Client, prefix string) *EtcdOwnershipStore {
 	return &EtcdOwnershipStore{
 		client:  client,
-		prefix:  cleanEtcdPrefix(prefix),
+		prefix:  tools.CleanEtcdPrefix(prefix),
 		timeout: defaultEtcdRequestTimeout,
 	}
 }
@@ -200,15 +201,4 @@ func decodeOwnership(data []byte) (Ownership, error) {
 		return Ownership{}, fmt.Errorf("decode ownership: %w", err)
 	}
 	return ownership, nil
-}
-
-func cleanEtcdPrefix(prefix string) string {
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		return "/testp"
-	}
-	if !strings.HasPrefix(prefix, "/") {
-		prefix = "/" + prefix
-	}
-	return path.Clean(prefix)
 }

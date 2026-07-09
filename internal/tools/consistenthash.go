@@ -8,15 +8,15 @@ import (
 
 type Hash func(data []byte) uint32
 
-type Map struct {
+type ConsistentHash struct {
 	hash     Hash
 	replicas int
-	keys     []int // Sorted
+	keys     []int
 	hashMap  map[int]string
 }
 
-func New(replicas int, fn Hash) *Map {
-	m := &Map{
+func NewConsistentHash(replicas int, fn Hash) *ConsistentHash {
+	m := &ConsistentHash{
 		replicas: replicas,
 		hash:     fn,
 		hashMap:  make(map[int]string),
@@ -27,7 +27,7 @@ func New(replicas int, fn Hash) *Map {
 	return m
 }
 
-func (m *Map) Add(keys ...string) {
+func (m *ConsistentHash) Add(keys ...string) {
 	for _, key := range keys {
 		for i := 0; i < m.replicas; i++ {
 			hash := int(m.hash([]byte(strconv.Itoa(i) + key)))
@@ -38,7 +38,7 @@ func (m *Map) Add(keys ...string) {
 	sort.Ints(m.keys)
 }
 
-func (m *Map) Remove(keys ...string) {
+func (m *ConsistentHash) Remove(keys ...string) {
 	for _, key := range keys {
 		for i := 0; i < m.replicas; i++ {
 			hash := int(m.hash([]byte(strconv.Itoa(i) + key)))
@@ -46,14 +46,12 @@ func (m *Map) Remove(keys ...string) {
 			if idx < len(m.keys) && m.keys[idx] == hash {
 				m.keys = append(m.keys[:idx], m.keys[idx+1:]...)
 				delete(m.hashMap, hash)
-			} else {
-				// Key not found, handle as needed (e.g., log, ignore, etc.)
 			}
 		}
 	}
 }
 
-func (m *Map) Get(key string) string {
+func (m *ConsistentHash) Get(key string) string {
 	if len(m.keys) == 0 {
 		return ""
 	}

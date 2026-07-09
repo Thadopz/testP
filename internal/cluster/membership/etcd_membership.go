@@ -7,8 +7,9 @@ import (
 	"path"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
+
+	"testP/internal/tools"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -29,7 +30,7 @@ type etcdNodeState struct {
 func NewEtcdMembershipStore(client *clientv3.Client, prefix string) *EtcdMembershipStore {
 	return &EtcdMembershipStore{
 		client:  client,
-		prefix:  cleanEtcdPrefix(prefix),
+		prefix:  tools.CleanEtcdPrefix(prefix),
 		timeout: defaultEtcdRequestTimeout,
 	}
 }
@@ -167,15 +168,4 @@ func leaseTTLSeconds(ttl time.Duration) int64 {
 		return 1
 	}
 	return seconds
-}
-
-func cleanEtcdPrefix(prefix string) string {
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		return "/testp"
-	}
-	if !strings.HasPrefix(prefix, "/") {
-		prefix = "/" + prefix
-	}
-	return path.Clean(prefix)
 }

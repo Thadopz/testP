@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"testP/internal/tools"
+
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -39,7 +41,7 @@ func NewEtcdElection(client *clientv3.Client, prefix string, controllerID string
 
 	return &EtcdElection{
 		client:  client,
-		key:     path.Join(cleanEtcdPrefix(prefix), "controller", "leader"),
+		key:     path.Join(tools.CleanEtcdPrefix(prefix), "controller", "leader"),
 		value:   controllerID,
 		ttl:     ttl,
 		timeout: defaultElectionTimeout,
@@ -187,15 +189,4 @@ func leaseTTLSeconds(ttl time.Duration) int64 {
 		return 1
 	}
 	return seconds
-}
-
-func cleanEtcdPrefix(prefix string) string {
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		return "/testp"
-	}
-	if !strings.HasPrefix(prefix, "/") {
-		prefix = "/" + prefix
-	}
-	return path.Clean(prefix)
 }

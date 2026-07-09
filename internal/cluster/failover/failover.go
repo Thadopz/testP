@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"testP/internal/cluster/membership"
 	"testP/internal/cluster/ownership"
-	"testP/tools"
+	"testP/internal/tools"
 )
 
 const failoverHashReplicas = 32
@@ -131,7 +131,7 @@ func chooseFailoverTarget(aliveNodes []int, shardID int) (int, error) {
 		return 0, fmt.Errorf("alive nodes must not be empty")
 	}
 
-	hashRing := tools.New(failoverHashReplicas, nil)
+	hashRing := tools.NewConsistentHash(failoverHashReplicas, nil)
 	for _, nodeID := range aliveNodes {
 		hashRing.Add(strconv.Itoa(nodeID))
 	}
