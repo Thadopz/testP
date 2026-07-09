@@ -17,6 +17,11 @@ type OrderMatched struct {
 	Score   int
 }
 
+type OrderMissed struct {
+	OrderID int64
+	Reason  string
+}
+
 type OrderRetryRequest struct {
 	OrderID int64
 	Attempt int

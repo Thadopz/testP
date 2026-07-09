@@ -2,7 +2,9 @@ package node
 
 import (
 	"context"
+	"errors"
 	"testP/internal/checkpoint"
+	clusterownership "testP/internal/cluster/ownership"
 	"testP/internal/eventlog"
 	"testP/internal/model"
 	"testing"
@@ -17,10 +19,22 @@ func TestRunnerRestartsFromFileCheckpoint(t *testing.T) {
 	appendRecoveryEvent(t, eventLog, recoveryEvent("event-2", 1))
 
 	firstApplier := &fakeApplier{}
-	firstRunner := NewRunner(10, []int{1}, eventLog, firstApplier, checkpointStore)
+	provider := newRecoveryShardProvider([]clusterownership.Ownership{
+		{ShardID: 1, NodeID: 10, Epoch: 1},
+	})
+	firstRunner := NewRunner(10, provider, eventLog, firstApplier, checkpointStore)
 
-	err := firstRunner.Run(context.Background())
-	if err != nil {
+	firstCtx, firstCancel := context.WithCancel(context.Background())
+	firstErrCh := make(chan error, 1)
+	go func() {
+		firstErrCh <- firstRunner.Run(firstCtx)
+	}()
+
+	waitForCheckpointOffset(t, checkpointStore, 10, 1, 2)
+	firstCancel()
+
+	err := <-firstErrCh
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("first Run returned error: %v", err)
 	}
 
@@ -28,24 +42,33 @@ func TestRunnerRestartsFromFileCheckpoint(t *testing.T) {
 		t.Fatalf("first runner applied events mismatch: got %q", appliedEventIDs(firstApplier))
 	}
 
-	loaded, found, err := checkpointStore.LoadCheckpoint(context.Background(), 10)
+	loaded, found, err := checkpointStore.LoadShardCheckpoint(context.Background(), 1)
 	if err != nil {
-		t.Fatalf("LoadCheckpoint returned error: %v", err)
+		t.Fatalf("LoadShardCheckpoint returned error: %v", err)
 	}
 	if !found {
 		t.Fatal("expected checkpoint to be found")
 	}
-	if loaded.Offset[1] != 2 {
-		t.Fatalf("checkpoint offset mismatch: got %d, want %d", loaded.Offset[1], int64(2))
+	if loaded.Offset != 2 {
+		t.Fatalf("checkpoint offset mismatch: got %d, want %d", loaded.Offset, int64(2))
 	}
 
 	appendRecoveryEvent(t, eventLog, recoveryEvent("event-3", 1))
 
 	secondApplier := &fakeApplier{}
-	secondRunner := NewRunner(10, []int{1}, eventLog, secondApplier, checkpointStore)
+	secondRunner := NewRunner(10, provider, eventLog, secondApplier, checkpointStore)
 
-	err = secondRunner.Run(context.Background())
-	if err != nil {
+	secondCtx, secondCancel := context.WithCancel(context.Background())
+	secondErrCh := make(chan error, 1)
+	go func() {
+		secondErrCh <- secondRunner.Run(secondCtx)
+	}()
+
+	waitForCheckpointOffset(t, checkpointStore, 10, 1, 3)
+	secondCancel()
+
+	err = <-secondErrCh
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("second Run returned error: %v", err)
 	}
 
@@ -54,7 +77,27 @@ func TestRunnerRestartsFromFileCheckpoint(t *testing.T) {
 	}
 }
 
-func appendRecoveryEvent(t *testing.T, eventLog eventlog.EventLog, event model.Event) {
+type recoveryShardProvider struct {
+	ownerships []clusterownership.Ownership
+}
+
+func newRecoveryShardProvider(ownerships []clusterownership.Ownership) *recoveryShardProvider {
+	return &recoveryShardProvider{
+		ownerships: append([]clusterownership.Ownership(nil), ownerships...),
+	}
+}
+
+func (p *recoveryShardProvider) ShardsForNode(nodeID int) ([]clusterownership.Ownership, error) {
+	result := make([]clusterownership.Ownership, 0)
+	for _, ownership := range p.ownerships {
+		if ownership.NodeID == nodeID {
+			result = append(result, ownership)
+		}
+	}
+	return result, nil
+}
+
+func appendRecoveryEvent(t *testing.T, eventLog eventlog.Appender, event model.Event) {
 	t.Helper()
 
 	_, err := eventLog.Append(context.Background(), event)

@@ -106,3 +106,28 @@ func TestFileStoreLoadReturnsContextError(t *testing.T) {
 		t.Fatalf("LoadCheckpoint error mismatch: got %v, want %v", err, context.Canceled)
 	}
 }
+
+func TestFileStoreSaveThenLoadShardCheckpoint(t *testing.T) {
+	store := NewFileStore(t.TempDir())
+
+	err := store.SaveShardCheckpoint(context.Background(), ShardCheckpoint{
+		ShardID: 1,
+		Offset:  100,
+		Epoch:   3,
+		NodeID:  10,
+	})
+	if err != nil {
+		t.Fatalf("SaveShardCheckpoint returned error: %v", err)
+	}
+
+	loaded, found, err := store.LoadShardCheckpoint(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("LoadShardCheckpoint returned error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected shard checkpoint to be found")
+	}
+	if loaded.Offset != 100 || loaded.Epoch != 3 || loaded.NodeID != 10 {
+		t.Fatalf("shard checkpoint mismatch: got %+v", loaded)
+	}
+}

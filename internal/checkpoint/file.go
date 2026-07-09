@@ -93,7 +93,81 @@ func (s *FileStore) LoadCheckpoint(ctx context.Context, nodeID int) (Checkpoint,
 	return copyCheckpoint(checkpoint), true, nil
 }
 
+func (s *FileStore) SaveShardCheckpoint(ctx context.Context, checkpoint ShardCheckpoint) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := os.MkdirAll(s.dir, 0755); err != nil {
+		return fmt.Errorf("create checkpoint dir: %w", err)
+	}
+
+	data, err := json.MarshalIndent(checkpoint, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode shard checkpoint: %w", err)
+	}
+
+	targetPath := s.shardCheckpointPath(checkpoint.ShardID)
+	tempPath := targetPath + ".tmp"
+
+	file, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("open temp shard checkpoint file: %w", err)
+	}
+	defer os.Remove(tempPath)
+
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return fmt.Errorf("write temp shard checkpoint file: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return fmt.Errorf("sync temp shard checkpoint file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close temp shard checkpoint file: %w", err)
+	}
+
+	if err := os.Rename(tempPath, targetPath); err != nil {
+		return fmt.Errorf("replace shard checkpoint file: %w", err)
+	}
+
+	return nil
+}
+
+func (s *FileStore) LoadShardCheckpoint(ctx context.Context, shardID int) (ShardCheckpoint, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return ShardCheckpoint{}, false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(s.shardCheckpointPath(shardID))
+	if errors.Is(err, os.ErrNotExist) {
+		return ShardCheckpoint{}, false, nil
+	}
+	if err != nil {
+		return ShardCheckpoint{}, false, fmt.Errorf("read shard checkpoint file: %w", err)
+	}
+
+	checkpoint := ShardCheckpoint{}
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		return ShardCheckpoint{}, true, fmt.Errorf("decode shard checkpoint file: %w", err)
+	}
+
+	return checkpoint, true, nil
+}
+
 func (s *FileStore) checkpointPath(nodeID int) string {
 	fileName := fmt.Sprintf("node-%d.json", nodeID)
+	return filepath.Join(s.dir, fileName)
+}
+
+func (s *FileStore) shardCheckpointPath(shardID int) string {
+	fileName := fmt.Sprintf("shard-%d.json", shardID)
 	return filepath.Join(s.dir, fileName)
 }

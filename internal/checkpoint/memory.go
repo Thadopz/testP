@@ -6,13 +6,15 @@ import (
 )
 
 type MemoryStore struct {
-	mu          sync.Mutex
-	checkpoints map[int]Checkpoint
+	mu               sync.Mutex
+	checkpoints      map[int]Checkpoint
+	shardCheckpoints map[int]ShardCheckpoint
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		checkpoints: make(map[int]Checkpoint),
+		checkpoints:      make(map[int]Checkpoint),
+		shardCheckpoints: make(map[int]ShardCheckpoint),
 	}
 }
 
@@ -46,6 +48,38 @@ func (s *MemoryStore) LoadCheckpoint(ctx context.Context, nodeID int) (Checkpoin
 	}
 
 	return copyCheckpoint(checkpoint), true, nil
+}
+
+func (s *MemoryStore) SaveShardCheckpoint(ctx context.Context, checkpoint ShardCheckpoint) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.shardCheckpoints == nil {
+		s.shardCheckpoints = make(map[int]ShardCheckpoint)
+	}
+
+	s.shardCheckpoints[checkpoint.ShardID] = checkpoint
+	return nil
+}
+
+func (s *MemoryStore) LoadShardCheckpoint(ctx context.Context, shardID int) (ShardCheckpoint, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return ShardCheckpoint{}, false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	checkpoint, ok := s.shardCheckpoints[shardID]
+	if !ok {
+		return ShardCheckpoint{}, false, nil
+	}
+
+	return checkpoint, true, nil
 }
 
 func copyCheckpoint(checkpoint Checkpoint) Checkpoint {

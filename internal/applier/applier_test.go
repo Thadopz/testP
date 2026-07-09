@@ -333,10 +333,46 @@ func TestEventApplierAppliesOrderMatchedState(t *testing.T) {
 	}
 }
 
+func TestEventApplierAppliesOrderMissedState(t *testing.T) {
+	codec := &eventlog.JSONEventCodec{}
+	engine := &fakeEngine{}
+	orderStore := orderstate.NewMemoryStore()
+	applier := NewEventApplierWithOrderStore(codec, engine, orderStore)
+
+	payload, err := codec.EncodePayload(model.OrderMissed{
+		OrderID: 1001,
+		Reason:  "no_rider_found",
+	})
+	if err != nil {
+		t.Fatalf("EncodePayload returned error: %v", err)
+	}
+	event := model.Event{
+		ID:      "event-missed",
+		Type:    model.EventOrderMissed,
+		ShardID: 1,
+		Payload: payload,
+	}
+
+	if err := applier.Apply(context.Background(), event); err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+
+	state, found, err := orderStore.Load(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected order state to be found")
+	}
+	if state.Status != orderstate.StatusMissed || state.MissReason != "no_rider_found" {
+		t.Fatalf("state mismatch: got %+v", state)
+	}
+}
+
 func TestEventApplierApplyWithFenceAppliesWhenOwnershipMatches(t *testing.T) {
 	codec := &eventlog.JSONEventCodec{}
 	engine := &fakeEngine{}
-	ownershipStore := clusterownership.NewMemoryOwnershipStore()
+	ownershipStore := newApplierTestOwnershipStore()
 	if err := ownershipStore.Assign(1, 10); err != nil {
 		t.Fatalf("Assign returned error: %v", err)
 	}
@@ -360,7 +396,7 @@ func TestEventApplierApplyWithFenceAppliesWhenOwnershipMatches(t *testing.T) {
 func TestEventApplierApplyWithFenceRejectsStaleOwnerBeforeApply(t *testing.T) {
 	codec := &eventlog.JSONEventCodec{}
 	engine := &fakeEngine{}
-	ownershipStore := clusterownership.NewMemoryOwnershipStore()
+	ownershipStore := newApplierTestOwnershipStore()
 	if err := ownershipStore.Assign(1, 20); err != nil {
 		t.Fatalf("Assign returned error: %v", err)
 	}
@@ -383,7 +419,7 @@ func TestEventApplierApplyWithFenceRejectsStaleOwnerBeforeApply(t *testing.T) {
 
 func TestEventApplierApplyWithFenceRejectsEpochChangeAfterApply(t *testing.T) {
 	codec := &eventlog.JSONEventCodec{}
-	ownershipStore := clusterownership.NewMemoryOwnershipStore()
+	ownershipStore := newApplierTestOwnershipStore()
 	if err := ownershipStore.Assign(1, 10); err != nil {
 		t.Fatalf("Assign returned error: %v", err)
 	}
@@ -427,6 +463,33 @@ func orderCreatedEvent(t *testing.T, codec eventlog.EventCodec, shardID int) mod
 		ShardID: shardID,
 		Payload: payload,
 	}
+}
+
+type applierTestOwnershipStore struct {
+	owners map[int]clusterownership.Ownership
+}
+
+func newApplierTestOwnershipStore() *applierTestOwnershipStore {
+	return &applierTestOwnershipStore{
+		owners: make(map[int]clusterownership.Ownership),
+	}
+}
+
+func (s *applierTestOwnershipStore) OwnerOf(shardID int) (clusterownership.Ownership, bool, error) {
+	ownership, ok := s.owners[shardID]
+	return ownership, ok, nil
+}
+
+func (s *applierTestOwnershipStore) Assign(shardID int, nodeID int) error {
+	ownership := s.owners[shardID]
+	ownership.ShardID = shardID
+	ownership.NodeID = nodeID
+	ownership.Epoch++
+	if ownership.Epoch == 0 {
+		ownership.Epoch = 1
+	}
+	s.owners[shardID] = ownership
+	return nil
 }
 
 type fakeEngine struct {

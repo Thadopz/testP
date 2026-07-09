@@ -7,6 +7,7 @@ const (
 	EventOrderCancelled    EventType = "order_cancelled"
 	EventOrderRetryRequest EventType = "order_retry_request"
 	EventOrderMatched      EventType = "order_matched"
+	EventOrderMissed       EventType = "order_missed"
 
 	EventRiderOnline  EventType = "rider_online"
 	EventRiderOffline EventType = "rider_offline"

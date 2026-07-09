@@ -1,216 +1,96 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
-	clusterownership "testP/internal/cluster/ownership"
+	"context"
+	"errors"
+	"sort"
+	"testP/internal/eventlog"
 	"testing"
+	"time"
 )
 
-func TestParseShardIDs(t *testing.T) {
-	shardIDs, err := parseShardIDs("0,1,2")
-	if err != nil {
-		t.Fatalf("parseShardIDs returned error: %v", err)
-	}
-
-	if len(shardIDs) != 3 || shardIDs[0] != 0 || shardIDs[1] != 1 || shardIDs[2] != 2 {
-		t.Fatalf("shard ids mismatch: got %v, want [0 1 2]", shardIDs)
+func TestParseBrokerListTrimsEmptyParts(t *testing.T) {
+	brokers := parseBrokerList(" 127.0.0.1:9092, ,localhost:9093 ")
+	if len(brokers) != 2 || brokers[0] != "127.0.0.1:9092" || brokers[1] != "localhost:9093" {
+		t.Fatalf("broker list mismatch: got %v", brokers)
 	}
 }
 
-func TestParseShardIDsTrimsSpaces(t *testing.T) {
-	shardIDs, err := parseShardIDs(" 0, 2 ")
+func TestParseEtcdEndpoints(t *testing.T) {
+	endpoints, err := parseEtcdEndpoints("127.0.0.1:2379, localhost:2381")
 	if err != nil {
-		t.Fatalf("parseShardIDs returned error: %v", err)
+		t.Fatalf("parseEtcdEndpoints returned error: %v", err)
 	}
-
-	if len(shardIDs) != 2 || shardIDs[0] != 0 || shardIDs[1] != 2 {
-		t.Fatalf("shard ids mismatch: got %v, want [0 2]", shardIDs)
+	if len(endpoints) != 2 || endpoints[0] != "127.0.0.1:2379" || endpoints[1] != "localhost:2381" {
+		t.Fatalf("endpoints mismatch: got %v", endpoints)
 	}
 }
 
-func TestParseShardIDsRejectsEmptyText(t *testing.T) {
-	_, err := parseShardIDs("")
+func TestParseEtcdEndpointsRejectsEmptyInput(t *testing.T) {
+	_, err := parseEtcdEndpoints(" , ")
 	if err == nil {
-		t.Fatal("expected parseShardIDs to return an error")
+		t.Fatal("expected parseEtcdEndpoints to return an error")
 	}
 }
 
-func TestParseShardIDsRejectsNonNumber(t *testing.T) {
-	_, err := parseShardIDs("a")
-	if err == nil {
-		t.Fatal("expected parseShardIDs to return an error")
-	}
-}
-
-func TestParseShardIDsRejectsNegativeNumber(t *testing.T) {
-	_, err := parseShardIDs("-1")
-	if err == nil {
-		t.Fatal("expected parseShardIDs to return an error")
-	}
-}
-
-func TestParseNodeIDs(t *testing.T) {
-	nodeIDs, err := parseNodeIDs("1,2,3")
+func TestBuildNodeEventLogReturnsKafkaEventLog(t *testing.T) {
+	eventLog, err := buildNodeEventLog("127.0.0.1:9092", "order-events")
 	if err != nil {
-		t.Fatalf("parseNodeIDs returned error: %v", err)
+		t.Fatalf("buildNodeEventLog returned error: %v", err)
 	}
-
-	if len(nodeIDs) != 3 || nodeIDs[0] != 1 || nodeIDs[1] != 2 || nodeIDs[2] != 3 {
-		t.Fatalf("node ids mismatch: got %v, want [1 2 3]", nodeIDs)
+	if _, ok := eventLog.(*eventlog.KafkaEventLog); !ok {
+		t.Fatalf("eventlog type mismatch: got %T, want *eventlog.KafkaEventLog", eventLog)
 	}
 }
 
-func TestParseNodeIDsTrimsSpaces(t *testing.T) {
-	nodeIDs, err := parseNodeIDs(" 1, 3 ")
+func TestRunMembershipHeartbeatMarksNodeAliveBeforeWaiting(t *testing.T) {
+	store := newNodeTestMembershipStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := runMembershipHeartbeat(ctx, store, 1, time.Second)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runMembershipHeartbeat error mismatch: got %v, want context.Canceled", err)
+	}
+
+	alive, err := store.IsAlive(1)
 	if err != nil {
-		t.Fatalf("parseNodeIDs returned error: %v", err)
+		t.Fatalf("IsAlive returned error: %v", err)
 	}
-
-	if len(nodeIDs) != 2 || nodeIDs[0] != 1 || nodeIDs[1] != 3 {
-		t.Fatalf("node ids mismatch: got %v, want [1 3]", nodeIDs)
-	}
-}
-
-func TestParseNodeIDsRejectsEmptyText(t *testing.T) {
-	_, err := parseNodeIDs("")
-	if err == nil {
-		t.Fatal("expected parseNodeIDs to return an error")
+	if !alive {
+		t.Fatal("expected node 1 to be marked alive")
 	}
 }
 
-func TestParseNodeIDsRejectsNonNumber(t *testing.T) {
-	_, err := parseNodeIDs("a")
-	if err == nil {
-		t.Fatal("expected parseNodeIDs to return an error")
+type nodeTestMembershipStore struct {
+	alive map[int]bool
+}
+
+func newNodeTestMembershipStore() *nodeTestMembershipStore {
+	return &nodeTestMembershipStore{
+		alive: make(map[int]bool),
 	}
 }
 
-func TestParseNodeIDsRejectsNonPositiveNumber(t *testing.T) {
-	_, err := parseNodeIDs("0")
-	if err == nil {
-		t.Fatal("expected parseNodeIDs to return an error")
-	}
+func (s *nodeTestMembershipStore) MarkAlive(nodeID int) error {
+	s.alive[nodeID] = true
+	return nil
 }
 
-func TestResolveShardIDsUsesManualShardsWhenNodesAreEmpty(t *testing.T) {
-	shardIDs, err := resolveShardIDs(1, "0,2", "", 64)
-	if err != nil {
-		t.Fatalf("resolveShardIDs returned error: %v", err)
-	}
-
-	if len(shardIDs) != 2 || shardIDs[0] != 0 || shardIDs[1] != 2 {
-		t.Fatalf("shard ids mismatch: got %v, want [0 2]", shardIDs)
-	}
+func (s *nodeTestMembershipStore) MarkDead(nodeID int) error {
+	delete(s.alive, nodeID)
+	return nil
 }
 
-func TestResolveShardIDsUsesModuloLayout(t *testing.T) {
-	shardIDs, err := resolveShardIDs(1, "99", "1,2", 6)
-	if err != nil {
-		t.Fatalf("resolveShardIDs returned error: %v", err)
+func (s *nodeTestMembershipStore) AliveNodes() ([]int, error) {
+	nodeIDs := make([]int, 0, len(s.alive))
+	for nodeID := range s.alive {
+		nodeIDs = append(nodeIDs, nodeID)
 	}
-
-	if len(shardIDs) != 3 || shardIDs[0] != 0 || shardIDs[1] != 2 || shardIDs[2] != 4 {
-		t.Fatalf("shard ids mismatch: got %v, want [0 2 4]", shardIDs)
-	}
+	sort.Ints(nodeIDs)
+	return nodeIDs, nil
 }
 
-func TestResolveShardIDsUsesCurrentNodeID(t *testing.T) {
-	shardIDs, err := resolveShardIDs(2, "99", "1,2", 6)
-	if err != nil {
-		t.Fatalf("resolveShardIDs returned error: %v", err)
-	}
-
-	if len(shardIDs) != 3 || shardIDs[0] != 1 || shardIDs[1] != 3 || shardIDs[2] != 5 {
-		t.Fatalf("shard ids mismatch: got %v, want [1 3 5]", shardIDs)
-	}
-}
-
-func TestResolveShardIDsRejectsUnknownNode(t *testing.T) {
-	_, err := resolveShardIDs(3, "99", "1,2", 6)
-	if err == nil {
-		t.Fatal("expected resolveShardIDs to return an error")
-	}
-}
-
-func TestResolveShardAssignmentDynamicReturnsProvider(t *testing.T) {
-	ownershipDir := t.TempDir()
-	shardIDs, provider, err := resolveShardAssignment(1, "99", "1,2", 6, true, ownershipDir)
-	if err != nil {
-		t.Fatalf("resolveShardAssignment returned error: %v", err)
-	}
-	if provider == nil {
-		t.Fatal("expected dynamic shard provider")
-	}
-	if len(shardIDs) != 3 || shardIDs[0] != 0 || shardIDs[1] != 2 || shardIDs[2] != 4 {
-		t.Fatalf("shard ids mismatch: got %v, want [0 2 4]", shardIDs)
-	}
-
-	if _, ok := provider.(*clusterownership.FileOwnershipStore); !ok {
-		t.Fatalf("provider type mismatch: got %T, want *clusterownership.FileOwnershipStore", provider)
-	}
-}
-
-func TestResolveShardAssignmentDynamicReadsExistingFileOwnership(t *testing.T) {
-	ownershipDir := t.TempDir()
-	store := clusterownership.NewFileOwnershipStore(ownershipDir)
-	if err := store.Assign(2, 1); err != nil {
-		t.Fatalf("Assign returned error: %v", err)
-	}
-
-	shardIDs, provider, err := resolveShardAssignment(1, "0", "", 6, true, ownershipDir)
-	if err != nil {
-		t.Fatalf("resolveShardAssignment returned error: %v", err)
-	}
-	if provider == nil {
-		t.Fatal("expected dynamic shard provider")
-	}
-	if len(shardIDs) != 1 || shardIDs[0] != 2 {
-		t.Fatalf("shard ids mismatch: got %v, want [2]", shardIDs)
-	}
-}
-
-func TestResolveShardAssignmentDynamicDoesNotOverwriteExistingOwnership(t *testing.T) {
-	ownershipDir := t.TempDir()
-	store := clusterownership.NewFileOwnershipStore(ownershipDir)
-	if err := store.Assign(0, 2); err != nil {
-		t.Fatalf("Assign returned error: %v", err)
-	}
-
-	shardIDs, _, err := resolveShardAssignment(1, "99", "1,2", 2, true, ownershipDir)
-	if err != nil {
-		t.Fatalf("resolveShardAssignment returned error: %v", err)
-	}
-	if len(shardIDs) != 0 {
-		t.Fatalf("shard ids mismatch: got %v, want []", shardIDs)
-	}
-
-	ownership, ok, err := store.OwnerOf(0)
-	if err != nil {
-		t.Fatalf("OwnerOf returned error: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected shard 0 ownership to exist")
-	}
-	if ownership.NodeID != 2 || ownership.Epoch != 1 {
-		t.Fatalf("ownership mismatch: got %+v, want node=2 epoch=1", ownership)
-	}
-}
-
-func TestResolveShardAssignmentDynamicCreatesOwnershipFile(t *testing.T) {
-	ownershipDir := t.TempDir()
-
-	_, _, err := resolveShardAssignment(1, "99", "1,2", 6, true, ownershipDir)
-	if err != nil {
-		t.Fatalf("resolveShardAssignment returned error: %v", err)
-	}
-
-	if !fileExists(filepath.Join(ownershipDir, "ownership.json")) {
-		t.Fatal("expected ownership file to exist")
-	}
-}
-
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+func (s *nodeTestMembershipStore) IsAlive(nodeID int) (bool, error) {
+	return s.alive[nodeID], nil
 }

@@ -21,8 +21,9 @@ type ShardedEngine struct {
 	//mutex只用于riderEvent的匹配，目前并不是性能瓶颈(详见benchmark)故先将就让事件用全局锁了
 	mu sync.Mutex
 	//指标
-	metrics *Metrics
-	wg      sync.WaitGroup
+	metrics    *Metrics
+	resultSink MatchResultSink
+	wg         sync.WaitGroup
 }
 
 // 每个shard持有一个matcher与订单channel，订单会分散到各个shard中并发处理订单
@@ -182,6 +183,10 @@ func (e *ShardedEngine) Layout() shard.Layout {
 	return e.layout
 }
 
+func (e *ShardedEngine) SetResultSink(sink MatchResultSink) {
+	e.resultSink = sink
+}
+
 func (e *ShardedEngine) workerLoop() {
 	defer e.wg.Done()
 
@@ -228,11 +233,31 @@ func (e *ShardedEngine) matchOne(homeShardID int, order *model.Order) {
 	best := e.findBestRider(homeShardID, order)
 	if best == nil {
 		e.metrics.Missed.Add(1)
+		e.saveMatchResult(MatchResult{
+			OrderID: order.ID,
+			ShardID: homeShardID,
+			Matched: false,
+		})
 		return
 	}
 
 	atomic.AddInt64(&best.Count, 1)
 	e.metrics.Matched.Add(1)
+	e.saveMatchResult(MatchResult{
+		OrderID: order.ID,
+		ShardID: homeShardID,
+		Matched: true,
+		RiderID: best.UID,
+		Score:   0,
+	})
+}
+
+func (e *ShardedEngine) saveMatchResult(result MatchResult) {
+	if e.resultSink == nil {
+		return
+	}
+
+	e.resultSink.SaveMatchResult(result)
 }
 
 func (e *ShardedEngine) findBestRider(homeShardID int, order *model.Order) *model.Rider {

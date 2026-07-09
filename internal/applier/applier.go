@@ -64,6 +64,8 @@ func (a *EventApplier) Apply(ctx context.Context, event model.Event) error {
 		return a.applyOrderRetryRequest(ctx, event)
 	case model.EventOrderMatched:
 		return a.applyOrderMatched(ctx, event)
+	case model.EventOrderMissed:
+		return a.applyOrderMissed(ctx, event)
 	case model.EventRiderOnline:
 		return a.riderEventFunc(event)
 	case model.EventRiderMoved:
@@ -248,6 +250,34 @@ func (a *EventApplier) applyOrderMatched(ctx context.Context, event model.Event)
 	return a.orderStore.Save(ctx, state)
 }
 
+func (a *EventApplier) applyOrderMissed(ctx context.Context, event model.Event) error {
+	payload := model.OrderMissed{}
+	if err := a.codec.DecodePayload(event.Payload, &payload); err != nil {
+		return err
+	}
+	if a.orderStore == nil {
+		return nil
+	}
+
+	state, found, err := a.orderStore.Load(ctx, payload.OrderID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		state.OrderID = payload.OrderID
+		state.ShardID = event.ShardID
+	}
+	if state.Status == orderstate.StatusMatched || state.Status == orderstate.StatusCancelled {
+		return nil
+	}
+
+	state.Status = orderstate.StatusMissed
+	state.MissReason = payload.Reason
+	state.LastEventID = event.ID
+	state.UpdatedAt = event.OccurredAt
+	return a.orderStore.Save(ctx, state)
+}
+
 func (a *EventApplier) submitOrder(ctx context.Context, orderID int64, x int, y int) error {
 	return a.engine.SubmitBatch(ctx, model.OrderBatch{
 		Orders: []model.Order{
@@ -263,6 +293,7 @@ func (a *EventApplier) submitOrder(ctx context.Context, orderID int64, x int, y 
 func orderAlreadySubmitted(status orderstate.Status) bool {
 	return status == orderstate.StatusSubmitted ||
 		status == orderstate.StatusMatched ||
+		status == orderstate.StatusMissed ||
 		status == orderstate.StatusCancelled
 }
 

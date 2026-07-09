@@ -19,6 +19,18 @@ type Engine interface {
 	OnlineRiders() int
 }
 
+type MatchResult struct {
+	OrderID int64
+	ShardID int
+	Matched bool
+	RiderID int64
+	Score   int
+}
+
+type MatchResultSink interface {
+	SaveMatchResult(result MatchResult)
+}
+
 type Metrics struct {
 	Submitted atomic.Int64
 	Matched   atomic.Int64

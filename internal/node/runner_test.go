@@ -12,207 +12,12 @@ import (
 	"time"
 )
 
-func TestRunnerStartsReadingEachShardFromSavedOffset(t *testing.T) {
-	eventLog := &fakeEventLog{
-		recordsByShard: map[int][]eventlog.Record{
-			1: {
-				testRecord("event-1", 1, 5),
-			},
-			2: {
-				testRecord("event-2", 2, 8),
-			},
-		},
-	}
-	applier := &fakeApplier{}
-	runner := NewRunner(10, []int{1, 2}, eventLog, applier, nil)
-	runner.nextStep[1] = 5
-	runner.nextStep[2] = 8
-
-	err := runner.Run(context.Background())
-	if err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-
-	if len(eventLog.readPositions) != 2 {
-		t.Fatalf("read position count mismatch: got %d, want %d", len(eventLog.readPositions), 2)
-	}
-
-	if eventLog.readPositions[0] != (eventlog.Position{ShardID: 1, Offset: 5}) {
-		t.Fatalf("first read position mismatch: got %+v", eventLog.readPositions[0])
-	}
-
-	if eventLog.readPositions[1] != (eventlog.Position{ShardID: 2, Offset: 8}) {
-		t.Fatalf("second read position mismatch: got %+v", eventLog.readPositions[1])
-	}
-}
-
-func TestRunnerAdvancesOffsetAfterApplySucceeds(t *testing.T) {
-	eventLog := &fakeEventLog{
-		recordsByShard: map[int][]eventlog.Record{
-			1: {
-				testRecord("event-1", 1, 0),
-				testRecord("event-2", 1, 1),
-			},
-		},
-	}
-	applier := &fakeApplier{}
-	runner := NewRunner(10, []int{1}, eventLog, applier, nil)
-
-	err := runner.Run(context.Background())
-	if err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-
-	if runner.nextStep[1] != 2 {
-		t.Fatalf("next offset mismatch: got %d, want %d", runner.nextStep[1], 2)
-	}
-}
-
-func TestRunnerDoesNotAdvanceOffsetWhenApplyFails(t *testing.T) {
-	eventLog := &fakeEventLog{
-		recordsByShard: map[int][]eventlog.Record{
-			1: {
-				testRecord("event-1", 1, 0),
-			},
-		},
-	}
-	applier := &fakeApplier{err: errors.New("apply failed")}
-	runner := NewRunner(10, []int{1}, eventLog, applier, nil)
-
-	err := runner.Run(context.Background())
-	if err == nil {
-		t.Fatal("expected Run to return an error")
-	}
-
-	if runner.nextStep[1] != 0 {
-		t.Fatalf("next offset mismatch: got %d, want %d", runner.nextStep[1], 0)
-	}
-}
-
-func TestRunnerReturnsReadFromError(t *testing.T) {
-	expectedErr := errors.New("read failed")
-	eventLog := &fakeEventLog{err: expectedErr}
-	applier := &fakeApplier{}
-	runner := NewRunner(10, []int{1}, eventLog, applier, nil)
-
-	err := runner.Run(context.Background())
-	if !errors.Is(err, expectedErr) {
-		t.Fatalf("Run error mismatch: got %v, want %v", err, expectedErr)
-	}
-}
-
-func TestRunnerTailReturnsErrorWhenEventLogDoesNotSupportTail(t *testing.T) {
-	runner := NewRunner(10, []int{1}, &readOnlyEventLog{}, &fakeApplier{}, nil)
-	runner.SetTail(true)
-
-	err := runner.Run(context.Background())
-	if err == nil {
-		t.Fatal("expected Run to return an error")
-	}
-}
-
-func TestRunnerTailAppliesNewRecordAndStopsOnCancel(t *testing.T) {
-	eventLog := newTailFakeEventLog()
-	applier := &fakeApplier{}
-	store := checkpoint.NewMemoryStore()
-	runner := NewRunner(10, []int{1}, eventLog, applier, store)
-	runner.SetTail(true)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 1)
-
-	go func() {
-		errCh <- runner.Run(ctx)
-	}()
-
-	waitForTailReader(t, eventLog)
-	eventLog.send(testRecord("event-1", 1, 0))
-	waitForAppliedEvents(t, applier, 1)
-	waitForCheckpointOffset(t, store, 10, 1, 1)
-
-	cancel()
-
-	err := <-errCh
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run error mismatch: got %v, want %v", err, context.Canceled)
-	}
-}
-
-func TestRunnerLoadsCheckpointBeforeReading(t *testing.T) {
-	eventLog := &fakeEventLog{
-		recordsByShard: map[int][]eventlog.Record{
-			1: {
-				testRecord("event-1", 1, 4),
-			},
-		},
-	}
-	applier := &fakeApplier{}
-	store := checkpoint.NewMemoryStore()
-
-	err := store.SaveCheckpoint(context.Background(), checkpoint.Checkpoint{
-		NodeID: 10,
-		Offset: map[int]int64{
-			1: 4,
-		},
-	})
-	if err != nil {
-		t.Fatalf("SaveCheckpoint returned error: %v", err)
-	}
-
-	runner := NewRunner(10, []int{1}, eventLog, applier, store)
-
-	err = runner.Run(context.Background())
-	if err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-
-	if len(eventLog.readPositions) != 1 {
-		t.Fatalf("read position count mismatch: got %d, want %d", len(eventLog.readPositions), 1)
-	}
-
-	if eventLog.readPositions[0] != (eventlog.Position{ShardID: 1, Offset: 4}) {
-		t.Fatalf("read position mismatch: got %+v", eventLog.readPositions[0])
-	}
-}
-
-func TestRunnerSavesCheckpointAfterApplySucceeds(t *testing.T) {
-	eventLog := &fakeEventLog{
-		recordsByShard: map[int][]eventlog.Record{
-			1: {
-				testRecord("event-1", 1, 0),
-			},
-		},
-	}
-	applier := &fakeApplier{}
-	store := checkpoint.NewMemoryStore()
-	runner := NewRunner(10, []int{1}, eventLog, applier, store)
-
-	err := runner.Run(context.Background())
-	if err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-
-	waitForCheckpointOffset(t, store, 10, 1, 1)
-}
-
-func TestDynamicRunnerRequiresTailMode(t *testing.T) {
-	provider := newFakeShardProvider([]clusterownership.Ownership{
-		{ShardID: 1, NodeID: 10, Epoch: 1},
-	})
-	runner := NewDynamicRunner(10, provider, &readOnlyEventLog{}, &fakeApplier{}, nil)
-
-	err := runner.Run(context.Background())
-	if err == nil {
-		t.Fatal("expected Run to return an error")
-	}
-}
-
 func TestDynamicRunnerRefreshOnceStartsOwnedShard(t *testing.T) {
 	provider := newFakeShardProvider([]clusterownership.Ownership{
 		{ShardID: 1, NodeID: 10, Epoch: 1},
 	})
 	eventLog := newDynamicTailFakeEventLog()
-	runner := NewDynamicRunner(10, provider, eventLog, &fakeApplier{}, nil)
+	runner := NewRunner(10, provider, eventLog, &fakeApplier{}, nil)
 	defer runner.stopAllShards()
 
 	errCh := make(chan error, 10)
@@ -243,8 +48,7 @@ func TestDynamicRunnerRefreshOnceUsesSavedOffset(t *testing.T) {
 		{ShardID: 2, NodeID: 10, Epoch: 1},
 	})
 	eventLog := newDynamicTailFakeEventLog()
-	runner := NewDynamicRunner(10, provider, eventLog, &fakeApplier{}, nil)
-	runner.SetTail(true)
+	runner := NewRunner(10, provider, eventLog, &fakeApplier{}, nil)
 	runner.nextStep[2] = 7
 	defer runner.stopAllShards()
 
@@ -268,8 +72,7 @@ func TestDynamicRunnerRefreshOnceStopsRemovedShard(t *testing.T) {
 		{ShardID: 1, NodeID: 10, Epoch: 1},
 	})
 	eventLog := newDynamicTailFakeEventLog()
-	runner := NewDynamicRunner(10, provider, eventLog, &fakeApplier{}, nil)
-	runner.SetTail(true)
+	runner := NewRunner(10, provider, eventLog, &fakeApplier{}, nil)
 
 	errCh := make(chan error, 10)
 	if err := runner.refreshOnce(context.Background(), errCh); err != nil {
@@ -291,8 +94,7 @@ func TestDynamicRunnerRefreshOnceRestartsShardWhenEpochChanges(t *testing.T) {
 		{ShardID: 1, NodeID: 10, Epoch: 1},
 	})
 	eventLog := newDynamicTailFakeEventLog()
-	runner := NewDynamicRunner(10, provider, eventLog, &fakeApplier{}, nil)
-	runner.SetTail(true)
+	runner := NewRunner(10, provider, eventLog, &fakeApplier{}, nil)
 	defer runner.stopAllShards()
 
 	errCh := make(chan error, 10)
@@ -324,8 +126,7 @@ func TestDynamicRunnerRefreshOnceRestartsShardWhenEpochChanges(t *testing.T) {
 func TestDynamicRunnerRefreshOnceReturnsProviderError(t *testing.T) {
 	expectedErr := errors.New("provider failed")
 	provider := &fakeShardProvider{err: expectedErr}
-	runner := NewDynamicRunner(10, provider, newDynamicTailFakeEventLog(), &fakeApplier{}, nil)
-	runner.SetTail(true)
+	runner := NewRunner(10, provider, newDynamicTailFakeEventLog(), &fakeApplier{}, nil)
 
 	err := runner.refreshOnce(context.Background(), make(chan error, 1))
 	if !errors.Is(err, expectedErr) {
@@ -340,7 +141,7 @@ func TestDynamicRunnerRunAppliesRecordAndSavesCheckpoint(t *testing.T) {
 	eventLog := newDynamicTailFakeEventLog()
 	applier := &fakeApplier{}
 	store := checkpoint.NewMemoryStore()
-	runner := NewDynamicRunner(10, provider, eventLog, applier, store)
+	runner := NewRunner(10, provider, eventLog, applier, store)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -364,7 +165,7 @@ func TestDynamicRunnerRunAddsShardAfterProviderChanges(t *testing.T) {
 	provider := newFakeShardProvider(nil)
 	eventLog := newDynamicTailFakeEventLog()
 	applier := &fakeApplier{}
-	runner := NewDynamicRunner(10, provider, eventLog, applier, nil)
+	runner := NewRunner(10, provider, eventLog, applier, nil)
 	runner.refreshInterval = time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -394,7 +195,7 @@ func TestDynamicRunnerRunRemovesShardAfterProviderChanges(t *testing.T) {
 		{ShardID: 1, NodeID: 10, Epoch: 1},
 	})
 	eventLog := newDynamicTailFakeEventLog()
-	runner := NewDynamicRunner(10, provider, eventLog, &fakeApplier{}, nil)
+	runner := NewRunner(10, provider, eventLog, &fakeApplier{}, nil)
 	runner.refreshInterval = time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -415,14 +216,14 @@ func TestDynamicRunnerRunRemovesShardAfterProviderChanges(t *testing.T) {
 }
 
 func TestDynamicRunnerRecoveredOldOwnerStopsAfterFailover(t *testing.T) {
-	ownershipStore := clusterownership.NewMemoryOwnershipStore()
+	ownershipStore := newFakeShardProvider(nil)
 	if err := ownershipStore.Assign(1, 2); err != nil {
 		t.Fatalf("Assign returned error: %v", err)
 	}
 
 	eventLog := newDynamicTailFakeEventLog()
-	oldOwner := NewDynamicRunner(2, ownershipStore, eventLog, &fakeApplier{}, nil)
-	newOwner := NewDynamicRunner(1, ownershipStore, eventLog, &fakeApplier{}, nil)
+	oldOwner := NewRunner(2, ownershipStore, eventLog, &fakeApplier{}, nil)
+	newOwner := NewRunner(1, ownershipStore, eventLog, &fakeApplier{}, nil)
 	oldOwner.refreshInterval = time.Millisecond
 	newOwner.refreshInterval = time.Millisecond
 
@@ -461,8 +262,75 @@ func TestDynamicRunnerRecoveredOldOwnerStopsAfterFailover(t *testing.T) {
 	}
 }
 
+func TestDynamicRunnerFailoverUsesSharedShardCheckpoint(t *testing.T) {
+	ownershipStore := newFakeShardProvider(nil)
+	if err := ownershipStore.Assign(1, 2); err != nil {
+		t.Fatalf("Assign returned error: %v", err)
+	}
+
+	eventLog := newDynamicTailFakeEventLog()
+	checkpointStore := checkpoint.NewMemoryStore()
+	oldApplier := &fakeApplier{}
+	newApplier := &fakeApplier{}
+	oldOwner := NewRunner(2, ownershipStore, eventLog, oldApplier, checkpointStore)
+	newOwner := NewRunner(1, ownershipStore, eventLog, newApplier, checkpointStore)
+	oldOwner.refreshInterval = time.Millisecond
+	newOwner.refreshInterval = time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	oldErrCh := make(chan error, 1)
+	newErrCh := make(chan error, 1)
+	go func() {
+		oldErrCh <- oldOwner.Run(ctx)
+	}()
+	go func() {
+		newErrCh <- newOwner.Run(ctx)
+	}()
+
+	waitForActiveWorker(t, oldOwner, 1)
+	waitForDynamicTailPositionCount(t, eventLog, 1)
+	assertTailPosition(t, eventLog, 0, eventlog.Position{ShardID: 1, Offset: 0})
+
+	eventLog.send(1, testRecord("event-1", 1, 0))
+	eventLog.send(1, testRecord("event-2", 1, 1))
+	waitForAppliedEvents(t, oldApplier, 2)
+	waitForCheckpointOffset(t, checkpointStore, 2, 1, 2)
+
+	if err := ownershipStore.Assign(1, 1); err != nil {
+		t.Fatalf("Assign returned error: %v", err)
+	}
+
+	waitForInactiveWorker(t, oldOwner, 1)
+	waitForActiveWorker(t, newOwner, 1)
+	waitForDynamicTailPositionCount(t, eventLog, 2)
+	assertTailPosition(t, eventLog, 1, eventlog.Position{ShardID: 1, Offset: 2})
+
+	eventLog.send(1, testRecord("event-3", 1, 2))
+	waitForAppliedEvents(t, newApplier, 1)
+	waitForCheckpointOffset(t, checkpointStore, 1, 1, 3)
+
+	if appliedEventCount(oldApplier) != 2 {
+		t.Fatalf("old owner applied event count mismatch: got %d, want 2", appliedEventCount(oldApplier))
+	}
+	if appliedEventCount(newApplier) != 1 {
+		t.Fatalf("new owner applied event count mismatch: got %d, want 1", appliedEventCount(newApplier))
+	}
+
+	cancel()
+	oldErr := <-oldErrCh
+	if !errors.Is(oldErr, context.Canceled) {
+		t.Fatalf("old owner Run error mismatch: got %v, want %v", oldErr, context.Canceled)
+	}
+	newErr := <-newErrCh
+	if !errors.Is(newErr, context.Canceled) {
+		t.Fatalf("new owner Run error mismatch: got %v, want %v", newErr, context.Canceled)
+	}
+}
+
 func TestDynamicRunnerFenceStopsOldOwnerBeforeApply(t *testing.T) {
-	ownershipStore := clusterownership.NewMemoryOwnershipStore()
+	ownershipStore := newFakeShardProvider(nil)
 	if err := ownershipStore.Assign(1, 2); err != nil {
 		t.Fatalf("Assign returned error: %v", err)
 	}
@@ -470,7 +338,7 @@ func TestDynamicRunnerFenceStopsOldOwnerBeforeApply(t *testing.T) {
 	eventLog := newDynamicTailFakeEventLog()
 	applier := &fakeApplier{}
 	store := checkpoint.NewMemoryStore()
-	oldOwner := NewDynamicRunner(2, ownershipStore, eventLog, applier, store)
+	oldOwner := NewRunner(2, ownershipStore, eventLog, applier, store)
 	oldOwner.refreshInterval = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -509,7 +377,7 @@ func TestDynamicRunnerFenceStopsOldOwnerBeforeApply(t *testing.T) {
 }
 
 func TestDynamicRunnerFencePreventsCheckpointAfterApplyIfEpochChanges(t *testing.T) {
-	ownershipStore := clusterownership.NewMemoryOwnershipStore()
+	ownershipStore := newFakeShardProvider(nil)
 	if err := ownershipStore.Assign(1, 2); err != nil {
 		t.Fatalf("Assign returned error: %v", err)
 	}
@@ -521,7 +389,7 @@ func TestDynamicRunnerFencePreventsCheckpointAfterApplyIfEpochChanges(t *testing
 		newNodeID:      1,
 	}
 	store := checkpoint.NewMemoryStore()
-	oldOwner := NewDynamicRunner(2, ownershipStore, eventLog, applier, store)
+	oldOwner := NewRunner(2, ownershipStore, eventLog, applier, store)
 	oldOwner.refreshInterval = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -555,102 +423,16 @@ func TestDynamicRunnerFencePreventsCheckpointAfterApplyIfEpochChanges(t *testing
 	}
 }
 
-type readOnlyEventLog struct{}
-
-func (r *readOnlyEventLog) Append(ctx context.Context, event model.Event) (eventlog.Position, error) {
-	return eventlog.Position{}, nil
-}
-
-func (r *readOnlyEventLog) ReadFrom(ctx context.Context, position eventlog.Position) (<-chan eventlog.Record, error) {
-	recordCh := make(chan eventlog.Record)
-	close(recordCh)
-	return recordCh, nil
-}
-
-type fakeEventLog struct {
-	recordsByShard map[int][]eventlog.Record
-	readPositions  []eventlog.Position
-	err            error
-}
-
 type dynamicTailFakeEventLog struct {
 	mu        sync.Mutex
 	positions []eventlog.Position
 	streams   map[int]chan eventlog.Record
 }
 
-type tailFakeEventLog struct {
-	readyCh  chan struct{}
-	recordCh chan eventlog.Record
-}
-
-func newTailFakeEventLog() *tailFakeEventLog {
-	return &tailFakeEventLog{
-		readyCh:  make(chan struct{}),
-		recordCh: make(chan eventlog.Record),
-	}
-}
-
 func newDynamicTailFakeEventLog() *dynamicTailFakeEventLog {
 	return &dynamicTailFakeEventLog{
 		streams: make(map[int]chan eventlog.Record),
 	}
-}
-
-func (f *tailFakeEventLog) Append(ctx context.Context, event model.Event) (eventlog.Position, error) {
-	return eventlog.Position{}, nil
-}
-
-func (f *tailFakeEventLog) ReadFrom(ctx context.Context, position eventlog.Position) (<-chan eventlog.Record, error) {
-	recordCh := make(chan eventlog.Record)
-	close(recordCh)
-	return recordCh, nil
-}
-
-func (f *tailFakeEventLog) TailFrom(ctx context.Context, position eventlog.Position) (<-chan eventlog.Record, error) {
-	close(f.readyCh)
-	return f.recordCh, nil
-}
-
-func (f *tailFakeEventLog) send(record eventlog.Record) {
-	f.recordCh <- record
-}
-
-func (f *fakeEventLog) Append(ctx context.Context, event model.Event) (eventlog.Position, error) {
-	return eventlog.Position{}, nil
-}
-
-func (f *fakeEventLog) ReadFrom(ctx context.Context, position eventlog.Position) (<-chan eventlog.Record, error) {
-	f.readPositions = append(f.readPositions, position)
-	if f.err != nil {
-		return nil, f.err
-	}
-
-	recordCh := make(chan eventlog.Record)
-	records := append([]eventlog.Record(nil), f.recordsByShard[position.ShardID]...)
-
-	go func() {
-		defer close(recordCh)
-		for _, record := range records {
-			select {
-			case <-ctx.Done():
-				return
-			case recordCh <- record:
-			}
-		}
-	}()
-
-	return recordCh, nil
-}
-
-func (f *dynamicTailFakeEventLog) Append(ctx context.Context, event model.Event) (eventlog.Position, error) {
-	return eventlog.Position{}, nil
-}
-
-func (f *dynamicTailFakeEventLog) ReadFrom(ctx context.Context, position eventlog.Position) (<-chan eventlog.Record, error) {
-	recordCh := make(chan eventlog.Record)
-	close(recordCh)
-	return recordCh, nil
 }
 
 func (f *dynamicTailFakeEventLog) TailFrom(ctx context.Context, position eventlog.Position) (<-chan eventlog.Record, error) {
@@ -699,7 +481,13 @@ func (f *fakeShardProvider) ShardsForNode(nodeID int) ([]clusterownership.Owners
 		return nil, f.err
 	}
 
-	return append([]clusterownership.Ownership(nil), f.ownerships...), nil
+	ownerships := make([]clusterownership.Ownership, 0)
+	for _, ownership := range f.ownerships {
+		if ownership.NodeID == nodeID {
+			ownerships = append(ownerships, ownership)
+		}
+	}
+	return ownerships, nil
 }
 
 func (f *fakeShardProvider) setOwnerships(ownerships []clusterownership.Ownership) {
@@ -707,6 +495,39 @@ func (f *fakeShardProvider) setOwnerships(ownerships []clusterownership.Ownershi
 	defer f.mu.Unlock()
 
 	f.ownerships = append([]clusterownership.Ownership(nil), ownerships...)
+}
+
+func (f *fakeShardProvider) OwnerOf(shardID int) (clusterownership.Ownership, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for _, ownership := range f.ownerships {
+		if ownership.ShardID == shardID {
+			return ownership, true, nil
+		}
+	}
+	return clusterownership.Ownership{}, false, nil
+}
+
+func (f *fakeShardProvider) Assign(shardID int, nodeID int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for i, ownership := range f.ownerships {
+		if ownership.ShardID == shardID {
+			ownership.NodeID = nodeID
+			ownership.Epoch++
+			f.ownerships[i] = ownership
+			return nil
+		}
+	}
+
+	f.ownerships = append(f.ownerships, clusterownership.Ownership{
+		ShardID: shardID,
+		NodeID:  nodeID,
+		Epoch:   1,
+	})
+	return nil
 }
 
 func (n *Node) activeWorker(shardID int) (shardWorker, bool) {
@@ -808,7 +629,7 @@ func waitForAppliedEvents(t *testing.T, applier *fakeApplier, count int) {
 	}
 }
 
-func waitForCheckpointOffset(t *testing.T, store checkpoint.Store, nodeID int, shardID int, expectedOffset int64) {
+func waitForCheckpointOffset(t *testing.T, store checkpoint.ShardStore, nodeID int, shardID int, expectedOffset int64) {
 	t.Helper()
 
 	deadline := time.After(time.Second)
@@ -816,12 +637,12 @@ func waitForCheckpointOffset(t *testing.T, store checkpoint.Store, nodeID int, s
 	defer ticker.Stop()
 
 	for {
-		loaded, found, err := store.LoadCheckpoint(context.Background(), nodeID)
+		loaded, found, err := store.LoadShardCheckpoint(context.Background(), shardID)
 		if err != nil {
-			t.Fatalf("LoadCheckpoint returned error: %v", err)
+			t.Fatalf("LoadShardCheckpoint returned error: %v", err)
 		}
 
-		if found && loaded.Offset[shardID] == expectedOffset {
+		if found && loaded.Offset == expectedOffset {
 			return
 		}
 
@@ -830,16 +651,6 @@ func waitForCheckpointOffset(t *testing.T, store checkpoint.Store, nodeID int, s
 			t.Fatalf("checkpoint offset mismatch: got found=%v checkpoint=%+v, want shard %d offset %d", found, loaded, shardID, expectedOffset)
 		case <-ticker.C:
 		}
-	}
-}
-
-func waitForTailReader(t *testing.T, eventLog *tailFakeEventLog) {
-	t.Helper()
-
-	select {
-	case <-eventLog.readyCh:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for tail reader")
 	}
 }
 
@@ -861,6 +672,18 @@ func waitForDynamicTailPositionCount(t *testing.T, eventLog *dynamicTailFakeEven
 			t.Fatalf("tail position count mismatch: got %d, want at least %d", len(positions), count)
 		case <-ticker.C:
 		}
+	}
+}
+
+func assertTailPosition(t *testing.T, eventLog *dynamicTailFakeEventLog, index int, expected eventlog.Position) {
+	t.Helper()
+
+	positions := eventLog.tailPositions()
+	if index >= len(positions) {
+		t.Fatalf("tail position %d not found in %+v", index, positions)
+	}
+	if positions[index] != expected {
+		t.Fatalf("tail position mismatch at index %d: got %+v, want %+v", index, positions[index], expected)
 	}
 }
 

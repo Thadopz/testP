@@ -135,8 +135,54 @@ func TestRiderOfflineThenOnlineUpdatesMatcherIndexes(t *testing.T) {
 	}
 }
 
+func TestMatchOneWritesMatchedResult(t *testing.T) {
+	e := newTestShardedEngine([]*model.Rider{
+		{UID: 7, X: 0, Y: 0},
+	})
+	sink := &fakeResultSink{}
+	e.SetResultSink(sink)
+
+	order := &model.Order{ID: 1001, X: 0, Y: 0}
+	homeShardID := e.layout.ShardID(order.X, order.Y)
+	e.matchOne(homeShardID, order)
+
+	if len(sink.results) != 1 {
+		t.Fatalf("result count mismatch: got %d, want 1", len(sink.results))
+	}
+	result := sink.results[0]
+	if !result.Matched || result.OrderID != 1001 || result.RiderID != 7 || result.ShardID != homeShardID {
+		t.Fatalf("result mismatch: got %+v", result)
+	}
+}
+
+func TestMatchOneWritesMissedResult(t *testing.T) {
+	e := newTestShardedEngine(nil)
+	sink := &fakeResultSink{}
+	e.SetResultSink(sink)
+
+	order := &model.Order{ID: 1001, X: 0, Y: 0}
+	homeShardID := e.layout.ShardID(order.X, order.Y)
+	e.matchOne(homeShardID, order)
+
+	if len(sink.results) != 1 {
+		t.Fatalf("result count mismatch: got %d, want 1", len(sink.results))
+	}
+	result := sink.results[0]
+	if result.Matched || result.OrderID != 1001 || result.ShardID != homeShardID {
+		t.Fatalf("result mismatch: got %+v", result)
+	}
+}
+
 func newTestShardedEngine(riders []*model.Rider) *ShardedEngine {
 	return NewShardedEngine(riders, 9, 4, 10, 90, 1000)
+}
+
+type fakeResultSink struct {
+	results []MatchResult
+}
+
+func (s *fakeResultSink) SaveMatchResult(result MatchResult) {
+	s.results = append(s.results, result)
 }
 
 func riderUID(rider *model.Rider) any {

@@ -10,6 +10,7 @@ const (
 	StatusCancelled      Status = "cancelled"
 	StatusRetryRequested Status = "retry_requested"
 	StatusMatched        Status = "matched"
+	StatusMissed         Status = "missed"
 )
 
 type State struct {
@@ -21,6 +22,7 @@ type State struct {
 	Attempt      int
 	CancelReason string
 	RetryReason  string
+	MissReason   string
 	RiderID      int64
 	Score        int
 	LastEventID  string
