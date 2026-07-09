@@ -1,8 +1,10 @@
 param(
     [string]$DataDir = "",
-    [string]$ControllerAddr = "127.0.0.1:19000",
+    [string]$EtcdPrefix = "",
+    [string]$Brokers = "127.0.0.1:9092",
     [int]$ShardCount = 64,
-    [int]$TimeoutSeconds = 20
+    [int]$TimeoutSeconds = 25,
+    [switch]$KeepKafka
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,6 +46,15 @@ function Stop-ProcessIfRunning {
     $Process.WaitForExit(3000) | Out-Null
 }
 
+function Invoke-CheckedScript {
+    param([string[]]$ArgumentList)
+
+    & powershell @ArgumentList
+    if ($LASTEXITCODE -ne 0) {
+        throw "script failed: powershell $($ArgumentList -join ' ')"
+    }
+}
+
 function Start-E2EProcess {
     param(
         [string]$FilePath,
@@ -64,77 +75,81 @@ function Start-E2EProcess {
         -WindowStyle Hidden
 }
 
-function Initialize-AllShardsToNode {
-    param(
-        [string]$OwnershipDir,
-        [int]$ShardCount,
-        [int]$NodeID
-    )
+function Invoke-EtcdCtl {
+    param([string[]]$Arguments)
 
-    New-Item -ItemType Directory -Force -Path $OwnershipDir | Out-Null
+    $allArgs = @(
+        "exec",
+        "testp-etcd",
+        "/usr/local/bin/etcdctl",
+        "--endpoints=http://127.0.0.1:2379"
+    ) + $Arguments
 
-    $ownership = [ordered]@{}
-    for ($shardID = 0; $shardID -lt $ShardCount; $shardID++) {
-        $ownership["$shardID"] = [ordered]@{
-            ShardID = $shardID
-            NodeID  = $NodeID
-            Epoch   = 1
-        }
-    }
-
-    $ownershipPath = Join-Path $OwnershipDir "ownership.json"
-    $json = $ownership | ConvertTo-Json -Depth 5
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($ownershipPath, $json, $utf8NoBom)
+    return docker @allArgs
 }
 
-function Get-OwnershipValues {
-    param([string]$OwnershipPath)
+function Clear-EtcdPrefix {
+    param([string]$Prefix)
 
-    if (!(Test-Path $OwnershipPath)) {
+    Invoke-EtcdCtl -Arguments @("del", $Prefix, "--prefix") | Out-Null
+}
+
+function Get-EtcdOwnershipValues {
+    param([string]$Prefix)
+
+    $jsonText = Invoke-EtcdCtl -Arguments @("get", "$Prefix/ownership/shards/", "--prefix", "-w", "json")
+    if ([string]::IsNullOrWhiteSpace($jsonText)) {
         return @()
     }
 
-    $json = Get-Content -Path $OwnershipPath -Raw | ConvertFrom-Json
+    $parsed = $jsonText | ConvertFrom-Json
+    if ($null -eq $parsed.kvs) {
+        return @()
+    }
+
     $values = @()
-    foreach ($property in $json.PSObject.Properties) {
-        $values += $property.Value
+    foreach ($kv in $parsed.kvs) {
+        $bytes = [Convert]::FromBase64String($kv.value)
+        $valueText = [System.Text.Encoding]::UTF8.GetString($bytes)
+        $values += ($valueText | ConvertFrom-Json)
     }
     return $values
 }
 
-function Get-ProducedShardID {
-    param([string]$EventDir)
+function Get-EtcdCheckpointValues {
+    param([string]$Prefix)
 
-    $eventFile = Get-ChildItem -Path $EventDir -Filter "shard-*.log" | Select-Object -First 1
-    if ($null -eq $eventFile) {
-        return $null
+    $jsonText = Invoke-EtcdCtl -Arguments @("get", "$Prefix/checkpoints/shards/", "--prefix", "-w", "json")
+    if ([string]::IsNullOrWhiteSpace($jsonText)) {
+        return @()
     }
 
-    if ($eventFile.Name -match "^shard-(\d+)\.log$") {
-        return [int]$Matches[1]
+    $parsed = $jsonText | ConvertFrom-Json
+    if ($null -eq $parsed.kvs) {
+        return @()
+    }
+
+    $values = @()
+    foreach ($kv in $parsed.kvs) {
+        $bytes = [Convert]::FromBase64String($kv.value)
+        $valueText = [System.Text.Encoding]::UTF8.GetString($bytes)
+        $values += ($valueText | ConvertFrom-Json)
+    }
+    return $values
+}
+
+function Get-AnyCheckpointOffset {
+    param([string]$Prefix)
+
+    $checkpoints = @(Get-EtcdCheckpointValues -Prefix $Prefix)
+    foreach ($checkpoint in $checkpoints) {
+        $offset = [int64]$checkpoint.Offset
+        if ($offset -gt 0) {
+            return $offset
+        }
     }
 
     return $null
-}
-
-function Get-CheckpointOffset {
-    param(
-        [string]$CheckpointPath,
-        [int]$ShardID
-    )
-
-    if (!(Test-Path $CheckpointPath)) {
-        return $null
-    }
-
-    $checkpoint = Get-Content -Path $CheckpointPath -Raw | ConvertFrom-Json
-    $property = $checkpoint.Offset.PSObject.Properties["$ShardID"]
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return [int64]$property.Value
 }
 
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -143,14 +158,14 @@ $RepoRoot = Split-Path -Parent $ScriptRoot
 if ([string]::IsNullOrWhiteSpace($DataDir)) {
     $DataDir = Join-Path ([System.IO.Path]::GetTempPath()) ("testP-e2e-" + [Guid]::NewGuid().ToString("N"))
 }
+if ([string]::IsNullOrWhiteSpace($EtcdPrefix)) {
+    $EtcdPrefix = "/testp-e2e-" + [Guid]::NewGuid().ToString("N")
+}
 
 $DataDir = [System.IO.Path]::GetFullPath($DataDir)
 $BinDir = Join-Path $DataDir "bin"
 $LogDir = Join-Path $DataDir "logs"
-$OwnershipDir = Join-Path $DataDir "ownership"
-$OwnershipPath = Join-Path $OwnershipDir "ownership.json"
-$EventDir = Join-Path $DataDir "events"
-$CheckpointPath = Join-Path (Join-Path $DataDir "checkpoints") "node-1.json"
+$Topic = "order-events-" + [Guid]::NewGuid().ToString("N")
 
 $controller = $null
 $node1 = $null
@@ -159,11 +174,40 @@ $node2 = $null
 try {
     Write-Step "repo: $RepoRoot"
     Write-Step "data dir: $DataDir"
+    Write-Step "etcd prefix: $EtcdPrefix"
+    Write-Step "topic: $Topic"
 
     New-Item -ItemType Directory -Force -Path $BinDir, $LogDir | Out-Null
 
+    Write-Step "starting Kafka"
+    Invoke-CheckedScript -ArgumentList @(
+        "-ExecutionPolicy", "Bypass",
+        "-File", (Join-Path $ScriptRoot "kafka_up.ps1"),
+        "-TimeoutSeconds", "$TimeoutSeconds"
+    )
+
     Push-Location $RepoRoot
     try {
+        Write-Step "starting etcd"
+        docker compose up -d etcd | Out-Null
+
+        Write-Step "waiting for etcd"
+        Wait-Until -TimeoutSeconds $TimeoutSeconds -Description "etcd health" -Condition {
+            Invoke-EtcdCtl -Arguments @("endpoint", "health") | Out-Null
+            return ($LASTEXITCODE -eq 0)
+        }
+
+        Clear-EtcdPrefix -Prefix $EtcdPrefix
+
+        Write-Step "creating Kafka topic"
+        Invoke-CheckedScript -ArgumentList @(
+            "-ExecutionPolicy", "Bypass",
+            "-File", (Join-Path $ScriptRoot "kafka_create_topic.ps1"),
+            "-Topic", $Topic,
+            "-Partitions", "$ShardCount",
+            "-ReplicationFactor", "1"
+        )
+
         Write-Step "building controller/node/producer"
         go build -o (Join-Path $BinDir "controller.exe") ./cmd/controller
         go build -o (Join-Path $BinDir "node.exe") ./cmd/node
@@ -172,66 +216,73 @@ try {
         Pop-Location
     }
 
-    Write-Step "initializing ownership: all shards -> node 2"
-    Initialize-AllShardsToNode -OwnershipDir $OwnershipDir -ShardCount $ShardCount -NodeID 2
-
-    Write-Step "starting controller"
-    $controller = Start-E2EProcess `
-        -FilePath (Join-Path $BinDir "controller.exe") `
-        -ArgumentList @(
-            "-addr", $ControllerAddr,
-            "-data-dir", $DataDir,
-            "-heartbeat-timeout", "1500ms",
-            "-sweep-interval", "200ms"
-        ) `
-        -Name "controller" `
-        -LogDir $LogDir
-
-    Start-Sleep -Milliseconds 500
-    if ($controller.HasExited) {
-        throw "controller exited early. See $LogDir"
-    }
-
-    Write-Step "starting node 1 dynamic runner"
+    Write-Step "starting node 1"
     $node1 = Start-E2EProcess `
         -FilePath (Join-Path $BinDir "node.exe") `
         -ArgumentList @(
             "-node-id", "1",
-            "-dynamic",
-            "-tail",
             "-data-dir", $DataDir,
-            "-heartbeat-addr", $ControllerAddr,
             "-heartbeat-interval", "200ms",
+            "-membership-ttl", "1500ms",
+            "-etcd-endpoints", "127.0.0.1:2379",
+            "-etcd-prefix", $EtcdPrefix,
+            "-kafka-brokers", $Brokers,
+            "-kafka-topic", $Topic,
             "-riders", "20",
             "-workers", "1"
         ) `
         -Name "node1" `
         -LogDir $LogDir
 
-    Start-Sleep -Milliseconds 800
-    if ($node1.HasExited) {
-        throw "node 1 exited early. See $LogDir"
-    }
-
-    Write-Step "starting node 2 heartbeat owner"
+    Write-Step "starting node 2"
     $node2 = Start-E2EProcess `
         -FilePath (Join-Path $BinDir "node.exe") `
         -ArgumentList @(
             "-node-id", "2",
-            "-dynamic",
-            "-tail",
             "-data-dir", $DataDir,
-            "-heartbeat-addr", $ControllerAddr,
             "-heartbeat-interval", "200ms",
+            "-membership-ttl", "1500ms",
+            "-etcd-endpoints", "127.0.0.1:2379",
+            "-etcd-prefix", $EtcdPrefix,
+            "-kafka-brokers", $Brokers,
+            "-kafka-topic", $Topic,
             "-riders", "20",
             "-workers", "1"
         ) `
         -Name "node2" `
         -LogDir $LogDir
 
+    Write-Step "starting controller"
+    $controller = Start-E2EProcess `
+        -FilePath (Join-Path $BinDir "controller.exe") `
+        -ArgumentList @(
+            "-etcd-endpoints", "127.0.0.1:2379",
+            "-etcd-prefix", $EtcdPrefix,
+            "-membership-ttl", "1500ms",
+            "-election-ttl", "2s",
+            "-sweep-interval", "200ms",
+            "-shards", "$ShardCount"
+        ) `
+        -Name "controller" `
+        -LogDir $LogDir
+
     Start-Sleep -Milliseconds 800
-    if ($node2.HasExited) {
-        throw "node 2 exited before simulated failure. See $LogDir"
+    if ($node1.HasExited -or $node2.HasExited -or $controller.HasExited) {
+        throw "node or controller exited early. See $LogDir"
+    }
+
+    Write-Step "waiting for initial ownership"
+    Wait-Until -TimeoutSeconds $TimeoutSeconds -Description "initial ownership layout" -Condition {
+        $values = @(Get-EtcdOwnershipValues -Prefix $EtcdPrefix)
+        if ($values.Count -ne $ShardCount) {
+            return $false
+        }
+        foreach ($ownership in $values) {
+            if ([int]$ownership.NodeID -eq 2) {
+                return $true
+            }
+        }
+        return $false
     }
 
     Write-Step "simulating node 2 failure"
@@ -240,7 +291,7 @@ try {
 
     Write-Step "waiting for controller failover: node 2 shards -> node 1"
     Wait-Until -TimeoutSeconds $TimeoutSeconds -Description "ownership failover to node 1" -Condition {
-        $values = @(Get-OwnershipValues -OwnershipPath $OwnershipPath)
+        $values = @(Get-EtcdOwnershipValues -Prefix $EtcdPrefix)
         if ($values.Count -lt $ShardCount) {
             return $false
         }
@@ -256,7 +307,15 @@ try {
     Write-Step "writing one order event"
     $producer = Start-Process `
         -FilePath (Join-Path $BinDir "producer.exe") `
-        -ArgumentList @("-data-dir", $DataDir, "-orders", "1", "-seed", "7", "-start-id", "1001") `
+        -ArgumentList @(
+            "-eventlog", "kafka",
+            "-kafka-brokers", $Brokers,
+            "-kafka-topic", $Topic,
+            "-data-dir", $DataDir,
+            "-orders", "1",
+            "-seed", "7",
+            "-start-id", "1001"
+        ) `
         -WorkingDirectory $RepoRoot `
         -Wait `
         -PassThru `
@@ -268,25 +327,22 @@ try {
         throw "producer failed with exit code $($producer.ExitCode). See $LogDir"
     }
 
-    $producedShardID = Get-ProducedShardID -EventDir $EventDir
-    if ($null -eq $producedShardID) {
-        throw "could not find produced shard log in $EventDir"
-    }
-    Write-Step "produced shard: $producedShardID"
-
-    Write-Step "waiting for node 1 checkpoint on produced shard"
-    Wait-Until -TimeoutSeconds $TimeoutSeconds -Description "node 1 checkpoint offset for shard $producedShardID" -Condition {
-        $offset = Get-CheckpointOffset -CheckpointPath $CheckpointPath -ShardID $producedShardID
+    Write-Step "waiting for node 1 checkpoint to advance"
+    Wait-Until -TimeoutSeconds $TimeoutSeconds -Description "node 1 checkpoint offset" -Condition {
+        $offset = Get-AnyCheckpointOffset -Prefix $EtcdPrefix
         return ($null -ne $offset -and $offset -ge 1)
     }
 
     Write-Step "PASS"
     Write-Host "data_dir: $DataDir"
     Write-Host "logs_dir: $LogDir"
-    Write-Host "ownership_file: $OwnershipPath"
-    Write-Host "checkpoint_file: $CheckpointPath"
+    Write-Host "etcd_prefix: $EtcdPrefix"
+    Write-Host "checkpoint_prefix: $EtcdPrefix/checkpoints/shards/"
 } finally {
     Stop-ProcessIfRunning $node2
     Stop-ProcessIfRunning $node1
     Stop-ProcessIfRunning $controller
+    if (-not $KeepKafka) {
+        & powershell -ExecutionPolicy Bypass -File (Join-Path $ScriptRoot "kafka_down.ps1")
+    }
 }
