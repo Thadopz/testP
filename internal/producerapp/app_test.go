@@ -9,9 +9,11 @@ import (
 
 func TestRunWritesOrderCreatedEvents(t *testing.T) {
 	dataDir := t.TempDir()
+	fileEventLog := eventlog.NewFileEventLog(dataDir+"/events", &eventlog.JSONEventCodec{})
 
 	result, err := Run(context.Background(), Config{
 		DataDir:  dataDir,
+		EventLog: fileEventLog,
 		Orders:   3,
 		Seed:     1,
 		StartID:  10,
@@ -33,7 +35,6 @@ func TestRunWritesOrderCreatedEvents(t *testing.T) {
 		t.Fatalf("last id mismatch: got %d, want %d", result.LastID, int64(12))
 	}
 
-	fileEventLog := eventlog.NewFileEventLog(result.EventLogDir, &eventlog.JSONEventCodec{})
 	totalRecords := 0
 	for shardID := 0; shardID < 4; shardID++ {
 		recordCh, err := fileEventLog.ReadFrom(context.Background(), eventlog.Position{ShardID: shardID, Offset: 0})
@@ -52,8 +53,19 @@ func TestRunWritesOrderCreatedEvents(t *testing.T) {
 
 func TestRunRejectsNegativeOrders(t *testing.T) {
 	_, err := Run(context.Background(), Config{
+		DataDir:  t.TempDir(),
+		EventLog: &recordingEventLog{},
+		Orders:   -1,
+	})
+	if err == nil {
+		t.Fatal("expected Run to return an error")
+	}
+}
+
+func TestRunRequiresEventLog(t *testing.T) {
+	_, err := Run(context.Background(), Config{
 		DataDir: t.TempDir(),
-		Orders:  -1,
+		Orders:  1,
 	})
 	if err == nil {
 		t.Fatal("expected Run to return an error")

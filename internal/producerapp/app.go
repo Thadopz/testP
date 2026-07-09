@@ -43,9 +43,6 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	codec := &eventlog.JSONEventCodec{}
 	eventLogDir := filepath.Join(cfg.DataDir, "events")
 	activeEventLog := cfg.EventLog
-	if activeEventLog == nil {
-		activeEventLog = eventlog.NewFileEventLog(eventLogDir, codec)
-	}
 	layout := shard.NewLayout(cfg.AreaSize, cfg.CellSize, cfg.Shards)
 	rng := rand.New(rand.NewSource(cfg.Seed))
 
@@ -118,6 +115,9 @@ func withDefaults(cfg Config) Config {
 }
 
 func validateConfig(cfg Config) error {
+	if cfg.EventLog == nil {
+		return fmt.Errorf("eventlog is required")
+	}
 	if cfg.Orders < 0 {
 		return fmt.Errorf("orders must be >= 0")
 	}
