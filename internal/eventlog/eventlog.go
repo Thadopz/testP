@@ -18,18 +18,22 @@ type Record struct {
 	Event    model.Event
 }
 
-type EventLog interface {
+type Appender interface {
 	Append(ctx context.Context, event model.Event) (Position, error)
-	ReadFrom(ctx context.Context, position Position) (<-chan Record, error)
 }
 
-type TailEventLog interface {
-	EventLog
+type Tailer interface {
 	TailFrom(ctx context.Context, position Position) (<-chan Record, error)
 }
 
 type OffsetReader interface {
 	EndOffset(ctx context.Context, shardID int) (int64, error)
+}
+
+type EventLog interface {
+	Appender
+	Tailer
+	OffsetReader
 }
 
 type MemoryEventLog struct {
@@ -106,4 +110,8 @@ func (m *MemoryEventLog) ReadFrom(ctx context.Context, position Position) (<-cha
 		}
 	}()
 	return RecordCh, nil
+}
+
+func (m *MemoryEventLog) TailFrom(ctx context.Context, position Position) (<-chan Record, error) {
+	return m.ReadFrom(ctx, position)
 }

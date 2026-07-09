@@ -3,6 +3,7 @@ package producerapp
 import (
 	"context"
 	"testP/internal/eventlog"
+	"testP/internal/model"
 	"testing"
 )
 
@@ -57,4 +58,42 @@ func TestRunRejectsNegativeOrders(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Run to return an error")
 	}
+}
+
+func TestRunUsesInjectedEventLog(t *testing.T) {
+	eventLog := &recordingEventLog{}
+
+	_, err := Run(context.Background(), Config{
+		DataDir:  t.TempDir(),
+		EventLog: eventLog,
+		Orders:   2,
+		Seed:     1,
+		StartID:  10,
+		AreaSize: 1000,
+		CellSize: 100,
+		Shards:   4,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if len(eventLog.events) != 2 {
+		t.Fatalf("event count mismatch: got %d, want 2", len(eventLog.events))
+	}
+	if eventLog.events[0].Type != model.EventOrderCreated {
+		t.Fatalf("event type mismatch: got %q", eventLog.events[0].Type)
+	}
+}
+
+type recordingEventLog struct {
+	events []model.Event
+}
+
+func (l *recordingEventLog) Append(ctx context.Context, event model.Event) (eventlog.Position, error) {
+	position := eventlog.Position{
+		ShardID: event.ShardID,
+		Offset:  int64(len(l.events)),
+	}
+	l.events = append(l.events, event)
+	return position, nil
 }

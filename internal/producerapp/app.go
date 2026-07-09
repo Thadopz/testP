@@ -18,6 +18,7 @@ const (
 
 type Config struct {
 	DataDir  string
+	EventLog eventlog.Appender
 	Orders   int
 	Seed     int64
 	StartID  int64
@@ -41,7 +42,10 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 
 	codec := &eventlog.JSONEventCodec{}
 	eventLogDir := filepath.Join(cfg.DataDir, "events")
-	fileEventLog := eventlog.NewFileEventLog(eventLogDir, codec)
+	activeEventLog := cfg.EventLog
+	if activeEventLog == nil {
+		activeEventLog = eventlog.NewFileEventLog(eventLogDir, codec)
+	}
 	layout := shard.NewLayout(cfg.AreaSize, cfg.CellSize, cfg.Shards)
 	rng := rand.New(rand.NewSource(cfg.Seed))
 
@@ -64,7 +68,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			return Result{}, fmt.Errorf("encode order payload: %w", err)
 		}
 
-		_, err = fileEventLog.Append(ctx, model.Event{
+		_, err = activeEventLog.Append(ctx, model.Event{
 			ID:            fmt.Sprintf("order-%d-created", orderID),
 			Type:          model.EventOrderCreated,
 			AggregateType: "order",

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"testP/internal/eventlog"
 	"testP/internal/producerapp"
 )
 
@@ -15,16 +17,26 @@ func main() {
 	orderCount := flag.Int("orders", 100, "number of order_created events to write")
 	seed := flag.Int64("seed", 1, "random seed")
 	startID := flag.Int64("start-id", 1, "first order id")
+	eventLogType := flag.String("eventlog", "file", "eventlog backend: file or kafka")
+	kafkaBrokersText := flag.String("kafka-brokers", "127.0.0.1:9092", "comma-separated Kafka broker addresses")
+	kafkaTopic := flag.String("kafka-topic", "order-events", "Kafka topic for order events")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	activeEventLog, err := buildProducerEventLog(*eventLogType, *kafkaBrokersText, *kafkaTopic)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid eventlog config: %v\n", err)
+		os.Exit(2)
+	}
+
 	result, err := producerapp.Run(ctx, producerapp.Config{
-		DataDir: *dataDir,
-		Orders:  *orderCount,
-		Seed:    *seed,
-		StartID: *startID,
+		DataDir:  *dataDir,
+		EventLog: activeEventLog,
+		Orders:   *orderCount,
+		Seed:     *seed,
+		StartID:  *startID,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "producer failed: %v\n", err)
@@ -32,7 +44,35 @@ func main() {
 	}
 
 	fmt.Printf("eventlog_dir: %s\n", result.EventLogDir)
+	fmt.Printf("eventlog: %s\n", *eventLogType)
 	fmt.Printf("orders: %d\n", result.Orders)
 	fmt.Printf("first_id: %d\n", result.FirstID)
 	fmt.Printf("last_id: %d\n", result.LastID)
+}
+
+func buildProducerEventLog(eventLogType string, brokersText string, topic string) (eventlog.Appender, error) {
+	switch strings.ToLower(strings.TrimSpace(eventLogType)) {
+	case "", "file":
+		return nil, nil
+	case "kafka":
+		return eventlog.NewKafkaEventLog(eventlog.KafkaConfig{
+			Brokers: parseBrokerList(brokersText),
+			Topic:   topic,
+			Codec:   &eventlog.JSONEventCodec{},
+		})
+	default:
+		return nil, fmt.Errorf("unknown eventlog backend %q", eventLogType)
+	}
+}
+
+func parseBrokerList(text string) []string {
+	parts := strings.Split(text, ",")
+	brokers := make([]string, 0, len(parts))
+	for _, part := range parts {
+		broker := strings.TrimSpace(part)
+		if broker != "" {
+			brokers = append(brokers, broker)
+		}
+	}
+	return brokers
 }
