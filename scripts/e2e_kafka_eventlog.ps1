@@ -91,25 +91,6 @@ function Clear-EtcdPrefix {
     Invoke-EtcdCtl -Arguments @("del", $Prefix, "--prefix") | Out-Null
 }
 
-function Get-OrderStatus {
-    param(
-        [string]$OrderStatePath,
-        [int64]$OrderID
-    )
-
-    if (!(Test-Path $OrderStatePath)) {
-        return $null
-    }
-
-    $orders = Get-Content -Path $OrderStatePath -Raw | ConvertFrom-Json
-    $property = $orders.PSObject.Properties["$OrderID"]
-    if ($null -eq $property) {
-        return $null
-    }
-
-    return [string]$property.Value.Status
-}
-
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptRoot
 
@@ -120,7 +101,6 @@ if ([string]::IsNullOrWhiteSpace($DataDir)) {
 $DataDir = [System.IO.Path]::GetFullPath($DataDir)
 $BinDir = Join-Path $DataDir "bin"
 $LogDir = Join-Path $DataDir "logs"
-$OrderStatePath = Join-Path (Join-Path $DataDir "orders") "orders.json"
 $Topic = "order-events-" + [Guid]::NewGuid().ToString("N")
 $EtcdPrefix = "/testp-kafka-e2e-" + [Guid]::NewGuid().ToString("N")
 $OrderID = 1001
@@ -216,7 +196,6 @@ try {
     $producer = Start-Process `
         -FilePath (Join-Path $BinDir "producer.exe") `
         -ArgumentList @(
-            "-eventlog", "kafka",
             "-kafka-brokers", $Brokers,
             "-kafka-topic", $Topic,
             "-data-dir", $DataDir,
@@ -237,7 +216,18 @@ try {
 
     Write-Step "waiting for order state to become matched or missed"
     Wait-Until -TimeoutSeconds $TimeoutSeconds -Description "order final state" -Condition {
-        $status = Get-OrderStatus -OrderStatePath $OrderStatePath -OrderID $OrderID
+        $jsonText = Invoke-EtcdCtl -Arguments @("get", "$EtcdPrefix/orderstate/orders/$OrderID", "-w", "json")
+        if ([string]::IsNullOrWhiteSpace($jsonText)) {
+            return $false
+        }
+        $parsed = $jsonText | ConvertFrom-Json
+        if ($null -eq $parsed.kvs) {
+            return $false
+        }
+        $bytes = [Convert]::FromBase64String($parsed.kvs[0].value)
+        $valueText = [System.Text.Encoding]::UTF8.GetString($bytes)
+        $orderState = $valueText | ConvertFrom-Json
+        $status = [string]$orderState.Status
         return ($status -eq "matched" -or $status -eq "missed")
     }
 
@@ -245,7 +235,7 @@ try {
     Write-Host "data_dir: $DataDir"
     Write-Host "logs_dir: $LogDir"
     Write-Host "topic: $Topic"
-    Write-Host "order_state_file: $OrderStatePath"
+    Write-Host "order_state_key: $EtcdPrefix/orderstate/orders/$OrderID"
 } finally {
     Stop-ProcessIfRunning $node
     Stop-ProcessIfRunning $controller

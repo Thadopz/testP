@@ -308,7 +308,6 @@ try {
     $producer = Start-Process `
         -FilePath (Join-Path $BinDir "producer.exe") `
         -ArgumentList @(
-            "-eventlog", "kafka",
             "-kafka-brokers", $Brokers,
             "-kafka-topic", $Topic,
             "-data-dir", $DataDir,
