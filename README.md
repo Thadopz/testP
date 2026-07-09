@@ -1,36 +1,35 @@
-# Program Design Test: Order Matching Distribution 
+# Program Design Test: Order Matching Distribution
 
-这是一个用 Go 编写的订单与骑手匹配模拟项目,用于验证在不同骑手规模、订单规模和运行时长约束下，系统能否持续生成订单并完成分配。
+这是一个用 Go 编写的订单与骑手匹配模拟项目，用于验证在不同骑手规模、订单规模和运行时长约束下，系统能否持续生成订单并完成分配。
 
-项目从先前的单机订单匹配 benchmark出发，在分布式方向上进行了拓展事件日志、分片拥有权、持久化、节点故障切换、epoch屏障和可观测指标等等的功能。
+项目从先前的单机订单匹配 benchmark 出发，在分布式方向上进行了拓展：事件日志、分片拥有权、持久化、节点故障切换、epoch 屏障和可观测指标等功能。
 
-其中核心逻辑先由我个人手写实现，AI参与了后续优化工作，主要内容如下
+其中核心逻辑先由我个人手写实现，AI 参与了后续优化工作，主要内容如下：
 
-- 设计事件字段Event、事件日志EventLog
-- 拥有权ownership、持久化checkpoint、存活检测membership：
-  - ownership是一个三元组(shard, node, epoch)，表示某个shard由哪个node在当前epoch拥有
-  - checkpoint记录了某一时刻下日志的Offset，epoch以及shard-node对，表示某个shard已经处理到哪个事件位置
-  - membership是一个接口，定义了检验节点是否存活的动作
-- 划分node，controller职责：
-  - controller负责维护shard ownership，节点心跳失效后重新分配shard
-  - node负责消费自己持有的shard并应用事件
+- 设计事件字段 `Event`、事件日志 `EventLog`。
+- 拥有权 `ownership`、持久化 `checkpoint`、存活检测 `membership`：
+  - `ownership` 是一个三元组 `(shard, node, epoch)`，表示某个 shard 由哪个 node 在当前 epoch 拥有。
+  - `checkpoint` 记录了某一时刻下日志的 Offset、epoch 以及 shard-node 对，表示某个 shard 已经处理到哪个事件位置。
+  - `membership` 是一个接口，定义了检验节点是否存活的动作。
+- 划分 `node`、`controller` 职责：
+  - `controller` 负责维护 shard ownership，节点心跳失效后重新分配 shard。
+  - `node` 负责消费自己持有的 shard 并应用事件。
 - 节点保活：
+  - 节点故障后让 shard 进行迁移，但是对于已经执行了操作后在持久化保存时宕机的情况，不加入 DB 事务锁可能会在其他 node 接手后进行重复操作。后面设计了 `orderState` 给正在进行持久化动作时标记 node 状态为 pending，但是意识到就算如此也要考虑标记过程是否也会宕机，可能这个问题不使用事务很难去进行一个完全的处理。
+- 事件应用前后使用 fencing 校验，防止脏写入：具体而言就是维护一个版本号 epoch，更新 shard 归属时就会自增，类似 CAS 的思路。
+- Controller 的一部分高可用能力：
+  - 通过 etcd 的租约以及事务锁，保证唯一 leader 的存在。在接入 etcd 前手动写了一个 raft 的简单实现，第二天起来给节点接入 etcd 时忘记这回事了，重新写的时候又觉得我直接用 etcd 不就好了...
+- 节点负载均衡：
+  - 使用一致性哈希分配 shard，默认一个 node 在哈希环上有 32 份，不过因为 shard 太少（64 个）可能会导致分布效果有点平庸。
+  - 通过 controller 更改 shard 的所属者。当 node 中的 `refreshOnce` 检测到 shard 归属变化时，将其从自己的 map 中移除并执行 `context.Cancel`。node 的执行层中设置了两层 fence 隔离，这里会有三种情况：1 是在第一层 fence 前检测到归属变化，安全退出；2 是在通过第一层后执行操作时变动，已经发生了操作，但是不会推进到持久化保存；3 是正在发生操作，可能会因为收到 `ctx.Done` 而取消操作，也可能不会。
 
-  - 节点故障后让shard进行迁移，但是对于已经执行了操作后在持久化保存时宕机的情况，不加入DB事务锁可能会在其他node接手后进行重复操作，后面设计了orderState给正在进行持久化动作时标记node状态为pending，但是意识到就算如此也要考虑标记过程是否也会宕机，可能这个问题不使用事务很难去进行一个完全的处理
-- 事件应用前后使用fencing校验，防止脏写入：具体而言就是维护一个版本号epoch，更新shard归属时就会自增，类似CAS的思路
-- Controller的一部分高可用能力
+主要写了事件从生成到分配到对应节点处理的整个流程，并从内存态实现转移到文件态实现，最后调用中间件完成最终实现。（由于先抽出接口写了内存实现和文件实现来验证能不能跑起来，所以项目中存在不少懒加载默认是加载内存或者文件实现。）
 
-  - 通过etcd的租约以及事务锁，保证唯一leader的存在，在接入etcd前手动写了一个raft的简单实现，第二天起来给节点接入etcd时忘记这回事了，重新写的时候又觉得我直接用etcd不就好了...
-- 节点负载均衡
-  - 使用一致性哈希分配shard，默认一个node在哈希环上有32份，不过因为shard太少(64个)可能会导致分布效果有点平庸。
-  - 通过controller更改shard的所属者，当node中的refreshOnce检测到shard归属变化时将其从自己的map中移除并执行context.Cancel，而node的执行层中设置了两层fence隔离，这里会有三种情况，1是在第一层fence前检测到归属变化，安全退出，2是在通过第一层后执行操作时变动，已经发生了操作，但是不会推进到持久化保存，3是正在发生操作，会因为收到Ctx.Done而取消操作
-  
+其中 AI 给出了一部分修改意见，并且对项目进行了重构与测试，接管了测试、指标收集和可观测性的构造。
 
-主要写了事件从生成到分配到对应节点处理的整个流程并从内存态实现转移到文件态实现，最后调用中间件完成最终实现。（由于先抽出接口写了内存实现和文件实现来验证能不能跑起来，所以项目中存在不少懒加载默认是加载内存或者文件实现）
+初步跑通功能后逐步替换为中间件实现，比如使用 Kafka 作为事件日志，etcd 作为分布式协调和持久化存储，顺便用来做Controller的选举制度，使用 Prometheus/Grafana 作为可观测指标和告警（这部分是 AI 构造的）。
 
-其中AI给出了一部分修改意见并且对项目进行了重构与测试，全程接管了测试、指标收集和可观测性的构造
 
-后面逐步替换为中间件实现，比如使用Kafka作为事件日志，etcd作为分布式协调和持久化存储，顺便用来做控制器的选举制度，目前还处于一个接口多种实现的中间态，使用Prometheus/Grafana作为可观测指标和告警（这部分是AI构造的）。
 
 ## 当前能力
 
@@ -58,8 +57,8 @@
 ```text
 cmd/
   controller/       controller CLI，主要负责参数解析
-  node/             node CLI，启动心跳、runner和metrics
-  producer/         producer CLI，向Kafka写入订单事件
+  node/             node CLI，启动心跳、runner 和 metrics
+  producer/         producer CLI，向 Kafka 写入订单事件
 internal/
   applier/          event -> engine/order state/checkpoint 的应用逻辑
   checkpoint/       shard checkpoint 存储
@@ -130,13 +129,13 @@ topic:      order-events
 
 ## 观测
 
-Prometheus:
+Prometheus：
 
 ```text
 http://localhost:9090
 ```
 
-Grafana:
+Grafana：
 
 ```text
 http://localhost:3000
