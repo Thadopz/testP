@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"path/filepath"
 	"testP/internal/eventlog"
+	"testP/internal/metrics"
 	"testP/internal/model"
 	"testP/internal/shard"
 )
@@ -25,6 +26,7 @@ type Config struct {
 	AreaSize int
 	CellSize int
 	Shards   int
+	Metrics  metrics.Recorder
 }
 
 type Result struct {
@@ -48,6 +50,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 
 	for index := 0; index < cfg.Orders; index++ {
 		if err := ctx.Err(); err != nil {
+			recordProducerError(cfg.Metrics, "context")
 			return Result{}, err
 		}
 
@@ -62,10 +65,11 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			Y:       y,
 		})
 		if err != nil {
+			recordProducerError(cfg.Metrics, "encode")
 			return Result{}, fmt.Errorf("encode order payload: %w", err)
 		}
 
-		_, err = activeEventLog.Append(ctx, model.Event{
+		event := model.Event{
 			ID:            fmt.Sprintf("order-%d-created", orderID),
 			Type:          model.EventOrderCreated,
 			AggregateType: "order",
@@ -73,10 +77,14 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			ShardID:       shardID,
 			OccurredAt:    int64(index + 1),
 			Payload:       payload,
-		})
+		}
+
+		_, err = activeEventLog.Append(ctx, event)
 		if err != nil {
+			recordProducerError(cfg.Metrics, "append")
 			return Result{}, fmt.Errorf("append order event: %w", err)
 		}
+		recordProducerEvent(cfg.Metrics, event)
 	}
 
 	result := Result{
@@ -90,6 +98,20 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 
 	return result, nil
+}
+
+func recordProducerEvent(recorder metrics.Recorder, event model.Event) {
+	if recorder == nil {
+		return
+	}
+	recorder.IncProducerEvent(string(event.Type), event.ShardID)
+}
+
+func recordProducerError(recorder metrics.Recorder, reason string) {
+	if recorder == nil {
+		return
+	}
+	recorder.IncProducerError(reason)
 }
 
 func withDefaults(cfg Config) Config {

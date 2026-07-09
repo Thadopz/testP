@@ -13,6 +13,7 @@ import (
 	clustermembership "testP/internal/cluster/membership"
 	clusterownership "testP/internal/cluster/ownership"
 	"testP/internal/eventlog"
+	appmetrics "testP/internal/metrics"
 	"testP/internal/nodeapp"
 	"testP/internal/orderstate"
 	"time"
@@ -41,6 +42,7 @@ func main() {
 	etcdPrefix := flag.String("etcd-prefix", "/testp", "etcd key prefix")
 	membershipTTL := flag.Duration("membership-ttl", 5*time.Second, "etcd membership ttl")
 	metricsInterval := flag.Duration("metrics-interval", 5*time.Second, "runtime metrics print interval; set 0 to disable")
+	metricsAddr := flag.String("metrics-addr", ":9101", "Prometheus metrics listen address; set empty to disable")
 	kafkaBrokersText := flag.String("kafka-brokers", "127.0.0.1:9092", "comma-separated Kafka broker addresses")
 	kafkaTopic := flag.String("kafka-topic", "order-events", "Kafka topic for order events")
 	flag.Parse()
@@ -54,6 +56,18 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	var metricsRecorder appmetrics.Recorder
+	if strings.TrimSpace(*metricsAddr) != "" {
+		prometheusRecorder := appmetrics.NewPrometheusRecorder(nil)
+		metricsRecorder = prometheusRecorder
+		go func() {
+			err := appmetrics.RunServer(ctx, *metricsAddr, prometheusRecorder.Handler())
+			if err != nil && !errors.Is(err, context.Canceled) {
+				fmt.Fprintf(os.Stderr, "metrics server stopped: %v\n", err)
+			}
+		}()
+	}
 
 	activeEventLog, err := buildNodeEventLog(*kafkaBrokersText, *kafkaTopic)
 	if err != nil {
@@ -76,6 +90,7 @@ func main() {
 		CheckpointStore: etcdRuntime.checkpoint,
 		OrderStateStore: etcdRuntime.orderState,
 		MetricsInterval: *metricsInterval,
+		MetricsRecorder: metricsRecorder,
 		MetricsSink: func(result nodeapp.Result, err error) {
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "metrics failed: %v\n", err)

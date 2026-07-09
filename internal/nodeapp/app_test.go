@@ -3,6 +3,7 @@ package nodeapp
 import (
 	"context"
 	"sort"
+	"sync"
 	"testP/internal/checkpoint"
 	clusterownership "testP/internal/cluster/ownership"
 	"testP/internal/eventlog"
@@ -211,6 +212,7 @@ func TestRunWithResultUsesInjectedShardCheckpointStore(t *testing.T) {
 func TestRunWithResultReportsMetricsWhileRunning(t *testing.T) {
 	dataDir := t.TempDir()
 	checkpointStore := checkpoint.NewMemoryStore()
+	metricsRecorder := newNodeappTestMetricsRecorder()
 	ownershipStore := newNodeappTestOwnershipStore()
 	if err := ownershipStore.Assign(1, 10); err != nil {
 		t.Fatalf("Assign returned error: %v", err)
@@ -232,6 +234,7 @@ func TestRunWithResultReportsMetricsWhileRunning(t *testing.T) {
 			Seed:            1,
 			RefreshInterval: time.Millisecond,
 			MetricsInterval: time.Millisecond,
+			MetricsRecorder: metricsRecorder,
 			MetricsSink: func(result Result, err error) {
 				if err != nil {
 					t.Errorf("MetricsSink received error: %v", err)
@@ -254,6 +257,8 @@ func TestRunWithResultReportsMetricsWhileRunning(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for runtime metrics")
 	}
+	waitForRecordedOwnedShards(t, metricsRecorder, 10, 1)
+	waitForRecordedShardMetric(t, metricsRecorder, 10, 1)
 
 	cancel()
 	if err := <-errCh; err != nil {
@@ -478,6 +483,176 @@ func TestBuildShardMetricsReportsLag(t *testing.T) {
 	}
 
 	assertShardMetric(t, metrics, 1, 0, 1, 3, 2)
+}
+
+type nodeappTestMetricsRecorder struct {
+	mu                sync.Mutex
+	ownedShards       map[int]int
+	submitted         map[int]int64
+	matched           map[int]int64
+	missed            map[int]int64
+	onlineRiders      map[int]int
+	checkpointOffsets map[[2]int]int64
+	eventLogOffsets   map[[2]int]int64
+	lags              map[[2]int]int64
+	epochs            map[[2]int]int64
+}
+
+func newNodeappTestMetricsRecorder() *nodeappTestMetricsRecorder {
+	return &nodeappTestMetricsRecorder{
+		ownedShards:       make(map[int]int),
+		submitted:         make(map[int]int64),
+		matched:           make(map[int]int64),
+		missed:            make(map[int]int64),
+		onlineRiders:      make(map[int]int),
+		checkpointOffsets: make(map[[2]int]int64),
+		eventLogOffsets:   make(map[[2]int]int64),
+		lags:              make(map[[2]int]int64),
+		epochs:            make(map[[2]int]int64),
+	}
+}
+
+func (r *nodeappTestMetricsRecorder) SetNodeOwnedShards(nodeID int, count int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.ownedShards[nodeID] = count
+}
+
+func (r *nodeappTestMetricsRecorder) SetNodeSubmitted(nodeID int, value int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.submitted[nodeID] = value
+}
+
+func (r *nodeappTestMetricsRecorder) SetNodeMatched(nodeID int, value int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.matched[nodeID] = value
+}
+
+func (r *nodeappTestMetricsRecorder) SetNodeMissed(nodeID int, value int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.missed[nodeID] = value
+}
+
+func (r *nodeappTestMetricsRecorder) SetNodeOnlineRiders(nodeID int, value int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.onlineRiders[nodeID] = value
+}
+
+func (r *nodeappTestMetricsRecorder) SetShardCheckpointOffset(nodeID int, shardID int, offset int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.checkpointOffsets[[2]int{nodeID, shardID}] = offset
+}
+
+func (r *nodeappTestMetricsRecorder) SetShardEventLogOffset(nodeID int, shardID int, offset int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.eventLogOffsets[[2]int{nodeID, shardID}] = offset
+}
+
+func (r *nodeappTestMetricsRecorder) SetShardLag(nodeID int, shardID int, lag int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.lags[[2]int{nodeID, shardID}] = lag
+}
+
+func (r *nodeappTestMetricsRecorder) SetShardEpoch(nodeID int, shardID int, epoch int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.epochs[[2]int{nodeID, shardID}] = epoch
+}
+
+func (r *nodeappTestMetricsRecorder) IncEventApply(nodeID int, shardID int, eventType string) {}
+
+func (r *nodeappTestMetricsRecorder) IncEventApplyError(nodeID int, shardID int, eventType string) {}
+
+func (r *nodeappTestMetricsRecorder) IncFencingReject(nodeID int, shardID int) {}
+
+func (r *nodeappTestMetricsRecorder) SetControllerLeader(controllerID string, leader bool) {}
+
+func (r *nodeappTestMetricsRecorder) IncControllerSweep(controllerID string) {}
+
+func (r *nodeappTestMetricsRecorder) IncControllerSweepError(controllerID string, reason string) {}
+
+func (r *nodeappTestMetricsRecorder) IncFailover(controllerID string, deadNodeID int) {}
+
+func (r *nodeappTestMetricsRecorder) SetAliveNodes(controllerID string, count int) {}
+
+func (r *nodeappTestMetricsRecorder) SetOwnedShards(controllerID string, count int) {}
+
+func (r *nodeappTestMetricsRecorder) SetShardsWithoutOwner(controllerID string, count int) {}
+
+func (r *nodeappTestMetricsRecorder) IncProducerEvent(eventType string, shardID int) {}
+
+func (r *nodeappTestMetricsRecorder) IncProducerError(reason string) {}
+
+func waitForRecordedOwnedShards(t *testing.T, recorder *nodeappTestMetricsRecorder, nodeID int, expectedCount int) {
+	t.Helper()
+
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		recorder.mu.Lock()
+		count, ok := recorder.ownedShards[nodeID]
+		recorder.mu.Unlock()
+		if ok && count == expectedCount {
+			return
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("recorded owned shard count mismatch: got found=%v count=%d want %d", ok, count, expectedCount)
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForRecordedShardMetric(t *testing.T, recorder *nodeappTestMetricsRecorder, nodeID int, shardID int) {
+	t.Helper()
+
+	key := [2]int{nodeID, shardID}
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		recorder.mu.Lock()
+		_, hasCheckpoint := recorder.checkpointOffsets[key]
+		_, hasEventLog := recorder.eventLogOffsets[key]
+		_, hasLag := recorder.lags[key]
+		_, hasEpoch := recorder.epochs[key]
+		recorder.mu.Unlock()
+		if hasCheckpoint && hasEventLog && hasLag && hasEpoch {
+			return
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf(
+				"recorded shard metric missing: checkpoint=%v eventlog=%v lag=%v epoch=%v",
+				hasCheckpoint,
+				hasEventLog,
+				hasLag,
+				hasEpoch,
+			)
+		case <-ticker.C:
+		}
+	}
 }
 
 func appendOrderCreatedEvent(t *testing.T, eventLog eventlog.Appender, codec eventlog.EventCodec, eventID string, shardID int, orderID int64) {

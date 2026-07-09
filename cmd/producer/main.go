@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testP/internal/eventlog"
+	appmetrics "testP/internal/metrics"
 	"testP/internal/producerapp"
 )
 
@@ -17,12 +19,25 @@ func main() {
 	orderCount := flag.Int("orders", 100, "number of order_created events to write")
 	seed := flag.Int64("seed", 1, "random seed")
 	startID := flag.Int64("start-id", 1, "first order id")
+	metricsAddr := flag.String("metrics-addr", ":9103", "Prometheus metrics listen address; set empty to disable")
 	kafkaBrokersText := flag.String("kafka-brokers", "127.0.0.1:9092", "comma-separated Kafka broker addresses")
 	kafkaTopic := flag.String("kafka-topic", "order-events", "Kafka topic for order events")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	var metricsRecorder appmetrics.Recorder
+	if strings.TrimSpace(*metricsAddr) != "" {
+		prometheusRecorder := appmetrics.NewPrometheusRecorder(nil)
+		metricsRecorder = prometheusRecorder
+		go func() {
+			err := appmetrics.RunServer(ctx, *metricsAddr, prometheusRecorder.Handler())
+			if err != nil && !errors.Is(err, context.Canceled) {
+				fmt.Fprintf(os.Stderr, "metrics server stopped: %v\n", err)
+			}
+		}()
+	}
 
 	activeEventLog, err := buildProducerEventLog(*kafkaBrokersText, *kafkaTopic)
 	if err != nil {
@@ -36,6 +51,7 @@ func main() {
 		Orders:   *orderCount,
 		Seed:     *seed,
 		StartID:  *startID,
+		Metrics:  metricsRecorder,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "producer failed: %v\n", err)

@@ -13,6 +13,7 @@ import (
 	clusterownership "testP/internal/cluster/ownership"
 	"testP/internal/engine"
 	"testP/internal/eventlog"
+	"testP/internal/metrics"
 	"testP/internal/model"
 	"testP/internal/node"
 	"testP/internal/orderstate"
@@ -35,6 +36,7 @@ type Config struct {
 	OrderStateStore orderstate.Store
 	MetricsInterval time.Duration
 	MetricsSink     func(Result, error)
+	MetricsRecorder metrics.Recorder
 	Riders          int
 	Workers         int
 	Seed            int64
@@ -116,6 +118,7 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 
 	runner := node.NewRunner(cfg.NodeID, cfg.ShardProvider, activeEventLog, eventApplier, cfg.CheckpointStore)
 	runner.SetRefreshInterval(cfg.RefreshInterval)
+	runner.SetMetricsRecorder(cfg.MetricsRecorder)
 
 	if cfg.MetricsSink != nil && cfg.MetricsInterval > 0 {
 		go reportMetrics(ctx, cfg, activeEventLog, matchingEngine, eventLogDir, checkpointDir, orderStateDir)
@@ -183,7 +186,7 @@ func collectResult(
 		return Result{}, err
 	}
 
-	return Result{
+	result := Result{
 		NodeID:        cfg.NodeID,
 		ShardIDs:      shardIDs,
 		EventLogDir:   eventLogDir,
@@ -194,7 +197,28 @@ func collectResult(
 		Missed:        matchingEngine.Missed(),
 		OnlineRiders:  matchingEngine.OnlineRiders(),
 		ShardMetrics:  shardMetrics,
-	}, nil
+	}
+	recordResultMetrics(cfg.MetricsRecorder, result)
+	return result, nil
+}
+
+func recordResultMetrics(recorder metrics.Recorder, result Result) {
+	if recorder == nil {
+		return
+	}
+
+	recorder.SetNodeOwnedShards(result.NodeID, len(result.ShardIDs))
+	recorder.SetNodeSubmitted(result.NodeID, result.Submitted)
+	recorder.SetNodeMatched(result.NodeID, result.Matched)
+	recorder.SetNodeMissed(result.NodeID, result.Missed)
+	recorder.SetNodeOnlineRiders(result.NodeID, result.OnlineRiders)
+
+	for _, metric := range result.ShardMetrics {
+		recorder.SetShardCheckpointOffset(result.NodeID, metric.ShardID, metric.CheckpointOffset)
+		recorder.SetShardEventLogOffset(result.NodeID, metric.ShardID, metric.EventLogOffset)
+		recorder.SetShardLag(result.NodeID, metric.ShardID, metric.Lag)
+		recorder.SetShardEpoch(result.NodeID, metric.ShardID, metric.Epoch)
+	}
 }
 
 func withDefaults(cfg Config) Config {

@@ -2,6 +2,7 @@ package producerapp
 
 import (
 	"context"
+	"fmt"
 	"testP/internal/eventlog"
 	"testP/internal/model"
 	"testing"
@@ -10,6 +11,7 @@ import (
 func TestRunWritesOrderCreatedEvents(t *testing.T) {
 	dataDir := t.TempDir()
 	fileEventLog := eventlog.NewFileEventLog(dataDir+"/events", &eventlog.JSONEventCodec{})
+	metricsRecorder := newProducerTestMetricsRecorder()
 
 	result, err := Run(context.Background(), Config{
 		DataDir:  dataDir,
@@ -20,6 +22,7 @@ func TestRunWritesOrderCreatedEvents(t *testing.T) {
 		AreaSize: 1000,
 		CellSize: 100,
 		Shards:   4,
+		Metrics:  metricsRecorder,
 	})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
@@ -48,6 +51,9 @@ func TestRunWritesOrderCreatedEvents(t *testing.T) {
 
 	if totalRecords != 3 {
 		t.Fatalf("record count mismatch: got %d, want %d", totalRecords, 3)
+	}
+	if metricsRecorder.totalProducerEvents() != 3 {
+		t.Fatalf("producer event metric mismatch: got %d, want 3", metricsRecorder.totalProducerEvents())
 	}
 }
 
@@ -108,4 +114,71 @@ func (l *recordingEventLog) Append(ctx context.Context, event model.Event) (even
 	}
 	l.events = append(l.events, event)
 	return position, nil
+}
+
+type producerTestMetricsRecorder struct {
+	producerEvents map[[2]string]int
+	producerErrors map[string]int
+}
+
+func newProducerTestMetricsRecorder() *producerTestMetricsRecorder {
+	return &producerTestMetricsRecorder{
+		producerEvents: make(map[[2]string]int),
+		producerErrors: make(map[string]int),
+	}
+}
+
+func (r *producerTestMetricsRecorder) SetNodeOwnedShards(nodeID int, count int) {}
+
+func (r *producerTestMetricsRecorder) SetNodeSubmitted(nodeID int, value int64) {}
+
+func (r *producerTestMetricsRecorder) SetNodeMatched(nodeID int, value int64) {}
+
+func (r *producerTestMetricsRecorder) SetNodeMissed(nodeID int, value int64) {}
+
+func (r *producerTestMetricsRecorder) SetNodeOnlineRiders(nodeID int, value int) {}
+
+func (r *producerTestMetricsRecorder) SetShardCheckpointOffset(nodeID int, shardID int, offset int64) {
+}
+
+func (r *producerTestMetricsRecorder) SetShardEventLogOffset(nodeID int, shardID int, offset int64) {}
+
+func (r *producerTestMetricsRecorder) SetShardLag(nodeID int, shardID int, lag int64) {}
+
+func (r *producerTestMetricsRecorder) SetShardEpoch(nodeID int, shardID int, epoch int64) {}
+
+func (r *producerTestMetricsRecorder) IncEventApply(nodeID int, shardID int, eventType string) {}
+
+func (r *producerTestMetricsRecorder) IncEventApplyError(nodeID int, shardID int, eventType string) {}
+
+func (r *producerTestMetricsRecorder) IncFencingReject(nodeID int, shardID int) {}
+
+func (r *producerTestMetricsRecorder) SetControllerLeader(controllerID string, leader bool) {}
+
+func (r *producerTestMetricsRecorder) IncControllerSweep(controllerID string) {}
+
+func (r *producerTestMetricsRecorder) IncControllerSweepError(controllerID string, reason string) {}
+
+func (r *producerTestMetricsRecorder) IncFailover(controllerID string, deadNodeID int) {}
+
+func (r *producerTestMetricsRecorder) SetAliveNodes(controllerID string, count int) {}
+
+func (r *producerTestMetricsRecorder) SetOwnedShards(controllerID string, count int) {}
+
+func (r *producerTestMetricsRecorder) SetShardsWithoutOwner(controllerID string, count int) {}
+
+func (r *producerTestMetricsRecorder) IncProducerEvent(eventType string, shardID int) {
+	r.producerEvents[[2]string{eventType, fmt.Sprintf("%d", shardID)}]++
+}
+
+func (r *producerTestMetricsRecorder) IncProducerError(reason string) {
+	r.producerErrors[reason]++
+}
+
+func (r *producerTestMetricsRecorder) totalProducerEvents() int {
+	total := 0
+	for _, count := range r.producerEvents {
+		total += count
+	}
+	return total
 }

@@ -211,6 +211,82 @@ func TestEventApplierSkipsDuplicateSubmittedOrder(t *testing.T) {
 	}
 }
 
+func TestEventApplierReplayedOrderCreatedIsIdempotent(t *testing.T) {
+	codec := &eventlog.JSONEventCodec{}
+	engine := &fakeEngine{}
+	orderStore := orderstate.NewMemoryStore()
+	applier := NewEventApplierWithOrderStore(codec, engine, orderStore)
+	event := orderCreatedEvent(t, codec, 1)
+
+	if err := applier.Apply(context.Background(), event); err != nil {
+		t.Fatalf("first Apply returned error: %v", err)
+	}
+	if err := applier.Apply(context.Background(), event); err != nil {
+		t.Fatalf("second Apply returned error: %v", err)
+	}
+
+	if len(engine.submittedBatches) != 1 {
+		t.Fatalf("submitted batch count mismatch: got %d, want 1", len(engine.submittedBatches))
+	}
+	state, found, err := orderStore.Load(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected order state to be found")
+	}
+	if state.Status != orderstate.StatusSubmitted {
+		t.Fatalf("status mismatch: got %q, want %q", state.Status, orderstate.StatusSubmitted)
+	}
+}
+
+func TestEventApplierReplayedOrderCreatedDoesNotResubmitCancelledOrder(t *testing.T) {
+	codec := &eventlog.JSONEventCodec{}
+	engine := &fakeEngine{}
+	orderStore := orderstate.NewMemoryStore()
+	applier := NewEventApplierWithOrderStore(codec, engine, orderStore)
+	createdEvent := orderCreatedEvent(t, codec, 1)
+
+	if err := applier.Apply(context.Background(), createdEvent); err != nil {
+		t.Fatalf("created Apply returned error: %v", err)
+	}
+
+	cancelPayload, err := codec.EncodePayload(model.OrderCancelled{
+		OrderID: 1001,
+		Reason:  "user_cancelled",
+	})
+	if err != nil {
+		t.Fatalf("EncodePayload returned error: %v", err)
+	}
+	cancelEvent := model.Event{
+		ID:      "event-cancel",
+		Type:    model.EventOrderCancelled,
+		ShardID: 1,
+		Payload: cancelPayload,
+	}
+	if err := applier.Apply(context.Background(), cancelEvent); err != nil {
+		t.Fatalf("cancel Apply returned error: %v", err)
+	}
+
+	if err := applier.Apply(context.Background(), createdEvent); err != nil {
+		t.Fatalf("replayed created Apply returned error: %v", err)
+	}
+
+	if len(engine.submittedBatches) != 1 {
+		t.Fatalf("submitted batch count mismatch: got %d, want 1", len(engine.submittedBatches))
+	}
+	state, found, err := orderStore.Load(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected order state to be found")
+	}
+	if state.Status != orderstate.StatusCancelled {
+		t.Fatalf("status mismatch: got %q, want %q", state.Status, orderstate.StatusCancelled)
+	}
+}
+
 func TestEventApplierAppliesOrderCancelledState(t *testing.T) {
 	codec := &eventlog.JSONEventCodec{}
 	engine := &fakeEngine{}

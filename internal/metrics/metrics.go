@@ -1,0 +1,25 @@
+package metrics
+
+type Recorder interface {
+	SetNodeOwnedShards(nodeID int, count int)
+	SetNodeSubmitted(nodeID int, value int64)
+	SetNodeMatched(nodeID int, value int64)
+	SetNodeMissed(nodeID int, value int64)
+	SetNodeOnlineRiders(nodeID int, value int)
+	SetShardCheckpointOffset(nodeID int, shardID int, offset int64)
+	SetShardEventLogOffset(nodeID int, shardID int, offset int64)
+	SetShardLag(nodeID int, shardID int, lag int64)
+	SetShardEpoch(nodeID int, shardID int, epoch int64)
+	IncEventApply(nodeID int, shardID int, eventType string)
+	IncEventApplyError(nodeID int, shardID int, eventType string)
+	IncFencingReject(nodeID int, shardID int)
+	SetControllerLeader(controllerID string, leader bool)
+	IncControllerSweep(controllerID string)
+	IncControllerSweepError(controllerID string, reason string)
+	IncFailover(controllerID string, deadNodeID int)
+	SetAliveNodes(controllerID string, count int)
+	SetOwnedShards(controllerID string, count int)
+	SetShardsWithoutOwner(controllerID string, count int)
+	IncProducerEvent(eventType string, shardID int)
+	IncProducerError(reason string)
+}

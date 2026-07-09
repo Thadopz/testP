@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	clusterlayout "testP/internal/cluster/layout"
 	"testP/internal/cluster/membership"
 	"testP/internal/cluster/ownership"
+	appmetrics "testP/internal/metrics"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -33,6 +35,7 @@ func main() {
 	membershipTTL := flag.Duration("membership-ttl", 5*time.Second, "etcd membership ttl")
 	sweepInterval := flag.Duration("sweep-interval", time.Second, "dead node sweep interval")
 	shardCount := flag.Int("shards", 64, "number of shards to assign")
+	metricsAddr := flag.String("metrics-addr", ":9102", "Prometheus metrics listen address; set empty to disable")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -46,6 +49,17 @@ func main() {
 	defer stores.close()
 
 	failoverController := failover.NewFailoverController(stores.ownership, stores.membership)
+	var metricsRecorder appmetrics.Recorder
+	if strings.TrimSpace(*metricsAddr) != "" {
+		prometheusRecorder := appmetrics.NewPrometheusRecorder(nil)
+		metricsRecorder = prometheusRecorder
+		go func() {
+			err := appmetrics.RunServer(ctx, *metricsAddr, prometheusRecorder.Handler())
+			if err != nil && !errors.Is(err, context.Canceled) {
+				fmt.Fprintf(os.Stderr, "metrics server stopped: %v\n", err)
+			}
+		}()
+	}
 
 	ticker := time.NewTicker(*sweepInterval)
 	defer ticker.Stop()
@@ -63,7 +77,16 @@ func main() {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sweepController(ctx, stores.ownership, stores.membership, failoverController, stores.election, *shardCount)
+			sweepControllerWithMetrics(
+				ctx,
+				stores.ownership,
+				stores.membership,
+				failoverController,
+				stores.election,
+				*shardCount,
+				*controllerID,
+				metricsRecorder,
+			)
 		}
 	}
 }
@@ -124,32 +147,110 @@ func sweepController(
 	leaderElection *clusterelection.EtcdElection,
 	shardCount int,
 ) {
+	sweepControllerWithMetrics(ctx, ownershipStore, membershipStore, failoverController, leaderElection, shardCount, "", nil)
+}
+
+func sweepControllerWithMetrics(
+	ctx context.Context,
+	ownershipStore ownership.OwnershipStore,
+	membershipStore membership.MembershipStore,
+	failoverController *failover.FailoverController,
+	leaderElection *clusterelection.EtcdElection,
+	shardCount int,
+	controllerID string,
+	recorder appmetrics.Recorder,
+) {
+	if recorder != nil {
+		recorder.IncControllerSweep(controllerID)
+	}
 	if leaderElection == nil {
+		recordControllerSweepError(recorder, controllerID, "missing_election")
 		fmt.Fprintln(os.Stderr, "sweep failed: controller election is required")
 		return
 	}
 	leader, err := leaderElection.TryAcquire(ctx)
 	if err != nil {
+		recordControllerSweepError(recorder, controllerID, "election")
 		fmt.Fprintf(os.Stderr, "election failed: %v\n", err)
 		return
+	}
+	if recorder != nil {
+		recorder.SetControllerLeader(controllerID, leader)
 	}
 	if !leader {
 		return
 	}
 
 	if err := ensureInitialOwnership(ownershipStore, membershipStore, shardCount); err != nil {
+		recordControllerSweepError(recorder, controllerID, "initial_ownership")
 		fmt.Fprintf(os.Stderr, "initial ownership failed: %v\n", err)
 		return
 	}
 
 	deadNodeIDs, err := failoverController.FailoverMissingOwners()
 	if err != nil {
+		recordControllerSweepError(recorder, controllerID, "failover")
 		fmt.Fprintf(os.Stderr, "sweep failed: %v\n", err)
 		return
 	}
 	for _, nodeID := range deadNodeIDs {
+		if recorder != nil {
+			recorder.IncFailover(controllerID, nodeID)
+		}
 		fmt.Printf("node_dead: %d\n", nodeID)
 	}
+	recordControllerClusterMetrics(recorder, controllerID, ownershipStore, membershipStore, shardCount)
+}
+
+func recordControllerSweepError(recorder appmetrics.Recorder, controllerID string, reason string) {
+	if recorder == nil {
+		return
+	}
+	recorder.IncControllerSweepError(controllerID, reason)
+}
+
+func recordControllerClusterMetrics(
+	recorder appmetrics.Recorder,
+	controllerID string,
+	ownershipStore ownership.OwnershipStore,
+	membershipStore membership.MembershipStore,
+	shardCount int,
+) {
+	if recorder == nil {
+		return
+	}
+
+	aliveNodes, err := membershipStore.AliveNodes()
+	if err == nil {
+		recorder.SetAliveNodes(controllerID, len(aliveNodes))
+	} else {
+		recorder.IncControllerSweepError(controllerID, "metrics_alive_nodes")
+	}
+
+	lister, ok := ownershipStore.(ownership.OwnershipLister)
+	if !ok {
+		recorder.IncControllerSweepError(controllerID, "metrics_ownership_lister")
+		return
+	}
+	ownerships, err := lister.AllOwnerships()
+	if err != nil {
+		recorder.IncControllerSweepError(controllerID, "metrics_ownership")
+		return
+	}
+
+	ownedShardIDs := make(map[int]bool, len(ownerships))
+	for _, currentOwnership := range ownerships {
+		if currentOwnership.ShardID >= 0 && currentOwnership.ShardID < shardCount {
+			ownedShardIDs[currentOwnership.ShardID] = true
+		}
+	}
+	recorder.SetOwnedShards(controllerID, len(ownedShardIDs))
+
+	missingCount := shardCount - len(ownedShardIDs)
+	if missingCount < 0 {
+		missingCount = 0
+	}
+	recorder.SetShardsWithoutOwner(controllerID, missingCount)
 }
 
 func ensureInitialOwnership(ownershipStore ownership.OwnershipStore, membershipStore membership.MembershipStore, shardCount int) error {

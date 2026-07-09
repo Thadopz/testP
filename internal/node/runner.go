@@ -8,6 +8,7 @@ import (
 	"testP/internal/checkpoint"
 	clusterownership "testP/internal/cluster/ownership"
 	"testP/internal/eventlog"
+	"testP/internal/metrics"
 	"testP/internal/model"
 	"time"
 )
@@ -34,6 +35,7 @@ type Node struct {
 	nextStep        map[int]int64
 	active          map[int]*shardWorker
 	provider        clusterownership.ShardProvider
+	metricsRecorder metrics.Recorder
 	refreshInterval time.Duration
 }
 
@@ -68,6 +70,10 @@ func (n *Node) SetRefreshInterval(interval time.Duration) {
 	if interval > 0 {
 		n.refreshInterval = interval
 	}
+}
+
+func (n *Node) SetMetricsRecorder(recorder metrics.Recorder) {
+	n.metricsRecorder = recorder
 }
 
 func (n *Node) Run(ctx context.Context) error {
@@ -189,6 +195,7 @@ func (n *Node) startShard(
 		err := n.runDynamicShard(shardCtx, eventCh, ownership)
 		//如果fence失败，说明节点落后了，删除shard退出等待controller重新分配
 		if errors.Is(err, clusterownership.ErrOwnershipFenceLost) {
+			n.recordFencingReject(ownership.ShardID)
 			n.removeActiveShardIfEpochMatches(ownership.ShardID, ownership.Epoch)
 			return
 		}
@@ -216,8 +223,10 @@ func (n *Node) runDynamicShard(ctx context.Context, eventCh <-chan eventlog.Reco
 
 			//执行事件，fence检测现已整合进apply动作前后
 			if err := n.applyDynamicEvent(ctx, record.Event, ownership); err != nil {
+				n.recordEventApplyError(record.Event)
 				return err
 			}
+			n.recordEventApply(record.Event)
 
 			//持久化
 			if err := n.advanceCheckpoint(ctx, record.Position, ownership); err != nil {
@@ -239,6 +248,27 @@ func (n *Node) applyDynamicEvent(ctx context.Context, event model.Event, ownersh
 		return err
 	}
 	return n.checkShardFence(ownership.ShardID, ownership.Epoch)
+}
+
+func (n *Node) recordEventApply(event model.Event) {
+	if n.metricsRecorder == nil {
+		return
+	}
+	n.metricsRecorder.IncEventApply(n.nodeID, event.ShardID, string(event.Type))
+}
+
+func (n *Node) recordEventApplyError(event model.Event) {
+	if n.metricsRecorder == nil {
+		return
+	}
+	n.metricsRecorder.IncEventApplyError(n.nodeID, event.ShardID, string(event.Type))
+}
+
+func (n *Node) recordFencingReject(shardID int) {
+	if n.metricsRecorder == nil {
+		return
+	}
+	n.metricsRecorder.IncFencingReject(n.nodeID, shardID)
 }
 
 func (n *Node) checkShardFence(shardID int, epoch int64) error {
