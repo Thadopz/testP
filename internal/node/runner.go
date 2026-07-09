@@ -12,6 +12,7 @@ import (
 	"time"
 )
 
+// 抽离子接口，方便测试
 type eventApplier interface {
 	Apply(ctx context.Context, event model.Event) error
 }
@@ -136,13 +137,11 @@ func (n *Node) loadShardCheckpoint(ctx context.Context, shardID int) (int64, err
 
 func (n *Node) advanceCheckpoint(ctx context.Context, position eventlog.Position, ownership clusterownership.Ownership) error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	n.nextStep[position.ShardID] = position.Offset + 1
+	n.mu.Unlock()
 	if n.store == nil {
 		return nil
 	}
-
 	return n.store.SaveShardCheckpoint(ctx, checkpoint.ShardCheckpoint{
 		ShardID:   position.ShardID,
 		Offset:    position.Offset + 1,
@@ -188,6 +187,7 @@ func (n *Node) startShard(
 
 	go func() {
 		err := n.runDynamicShard(shardCtx, eventCh, ownership)
+		//如果fence失败，说明节点落后了，删除shard退出等待controller重新分配
 		if errors.Is(err, clusterownership.ErrOwnershipFenceLost) {
 			n.removeActiveShardIfEpochMatches(ownership.ShardID, ownership.Epoch)
 			return
@@ -210,19 +210,16 @@ func (n *Node) runDynamicShard(ctx context.Context, eventCh <-chan eventlog.Reco
 			if !ok {
 				return nil
 			}
-
-			if err := n.checkShardFence(ownership.ShardID, ownership.Epoch); err != nil {
-				return err
-			}
-
 			if n.applier == nil {
 				return fmt.Errorf("applier not found")
 			}
 
+			//执行事件，fence检测现已整合进apply动作前后
 			if err := n.applyDynamicEvent(ctx, record.Event, ownership); err != nil {
 				return err
 			}
 
+			//持久化
 			if err := n.advanceCheckpoint(ctx, record.Position, ownership); err != nil {
 				return err
 			}
@@ -254,6 +251,7 @@ func (n *Node) checkShardFence(shardID int, epoch int64) error {
 	if err != nil {
 		return err
 	}
+	//正常情况下，一开始配分ownership时shard必定可以被找到
 	if !found {
 		return clusterownership.ErrOwnershipFenceLost
 	}
@@ -263,7 +261,6 @@ func (n *Node) checkShardFence(shardID int, epoch int64) error {
 
 	return nil
 }
-
 func (n *Node) removeActiveShardIfEpochMatches(shardID int, epoch int64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -286,12 +283,15 @@ func (n *Node) stopShard(shardID int) {
 		delete(n.active, shardID)
 	}
 	n.mu.Unlock()
-
+	//优雅退出shardWorker
 	if ok && worker.cancel != nil {
 		worker.cancel()
 	}
 }
 
+// refreshOnce会检查当前节点应该运行的shard列表和当前节点正在运行的shard列表，
+// desired是当前节点应该运行的shard列表，key是shardID，value是ownership
+// active是当前节点正在运行的shard列表，key是shardID，value是shardWorker
 func (n *Node) refreshOnce(ctx context.Context, errCh chan<- error) error {
 	ownerships, err := n.provider.ShardsForNode(n.nodeID)
 	if err != nil {
@@ -307,6 +307,7 @@ func (n *Node) refreshOnce(ctx context.Context, errCh chan<- error) error {
 		n.mu.Unlock()
 
 		if !running {
+			//如果当前节点没有运行该shard，则启动
 			if err := n.startShard(ctx, ownership, errCh); err != nil {
 				return err
 			}

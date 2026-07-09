@@ -361,11 +361,11 @@ func TestDynamicRunnerFenceStopsOldOwnerBeforeApply(t *testing.T) {
 		t.Fatalf("applied event count mismatch: got %d, want 0", appliedEventCount(applier))
 	}
 
-	loaded, found, err := store.LoadCheckpoint(context.Background(), 2)
+	loaded, found, err := store.LoadShardCheckpoint(context.Background(), 1)
 	if err != nil {
-		t.Fatalf("LoadCheckpoint returned error: %v", err)
+		t.Fatalf("LoadShardCheckpoint returned error: %v", err)
 	}
-	if found && loaded.Offset[1] != 0 {
+	if found && loaded.Offset != 0 {
 		t.Fatalf("checkpoint should not advance after fence loss: got %+v", loaded)
 	}
 
@@ -408,11 +408,11 @@ func TestDynamicRunnerFencePreventsCheckpointAfterApplyIfEpochChanges(t *testing
 		t.Fatalf("applied event count mismatch: got %d, want 1", applier.count())
 	}
 
-	loaded, found, err := store.LoadCheckpoint(context.Background(), 2)
+	loaded, found, err := store.LoadShardCheckpoint(context.Background(), 1)
 	if err != nil {
-		t.Fatalf("LoadCheckpoint returned error: %v", err)
+		t.Fatalf("LoadShardCheckpoint returned error: %v", err)
 	}
-	if found && loaded.Offset[1] != 0 {
+	if found && loaded.Offset != 0 {
 		t.Fatalf("checkpoint should not advance after epoch changes: got %+v", loaded)
 	}
 

@@ -32,6 +32,9 @@ type Config struct {
 	DataDir         string
 	EventLog        eventlog.EventLog
 	CheckpointStore checkpoint.ShardStore
+	OrderStateStore orderstate.Store
+	MetricsInterval time.Duration
+	MetricsSink     func(Result, error)
 	Riders          int
 	Workers         int
 	Seed            int64
@@ -101,17 +104,22 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 		matchingEngine.Wait()
 	}()
 
-	checkpointStore := cfg.CheckpointStore
-	if checkpointStore == nil {
-		checkpointStore = checkpoint.NewFileStore(checkpointDir)
+	orderStateStore := cfg.OrderStateStore
+	if orderStateStore == nil {
+		orderStateStore = orderstate.NewFileStore(orderStateDir)
 	}
-	orderStateStore := orderstate.NewFileStore(orderStateDir)
+
 	eventApplier := applier.NewEventApplierWithOrderStore(codec, matchingEngine, orderStateStore)
 	if reader, ok := cfg.ShardProvider.(applier.OwnershipReader); ok {
 		eventApplier = applier.NewFencedEventApplierWithOrderStore(codec, matchingEngine, cfg.NodeID, reader, orderStateStore)
 	}
-	runner := node.NewRunner(cfg.NodeID, cfg.ShardProvider, activeEventLog, eventApplier, checkpointStore)
+
+	runner := node.NewRunner(cfg.NodeID, cfg.ShardProvider, activeEventLog, eventApplier, cfg.CheckpointStore)
 	runner.SetRefreshInterval(cfg.RefreshInterval)
+
+	if cfg.MetricsSink != nil && cfg.MetricsInterval > 0 {
+		go reportMetrics(ctx, cfg, activeEventLog, matchingEngine, eventLogDir, checkpointDir, orderStateDir)
+	}
 
 	if err := runner.Run(ctx); err != nil {
 		if !errors.Is(err, context.Canceled) {
@@ -119,6 +127,47 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 		}
 	}
 
+	return collectResult(context.Background(), cfg, activeEventLog, matchingEngine, eventLogDir, checkpointDir, orderStateDir)
+}
+
+func reportMetrics(
+	ctx context.Context,
+	cfg Config,
+	activeEventLog eventlog.EventLog,
+	matchingEngine *engine.ShardedEngine,
+	eventLogDir string,
+	checkpointDir string,
+	orderStateDir string,
+) {
+	emit := func() {
+		result, err := collectResult(ctx, cfg, activeEventLog, matchingEngine, eventLogDir, checkpointDir, orderStateDir)
+		cfg.MetricsSink(result, err)
+	}
+
+	emit()
+
+	ticker := time.NewTicker(cfg.MetricsInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			emit()
+		}
+	}
+}
+
+func collectResult(
+	ctx context.Context,
+	cfg Config,
+	activeEventLog eventlog.EventLog,
+	matchingEngine *engine.ShardedEngine,
+	eventLogDir string,
+	checkpointDir string,
+	orderStateDir string,
+) (Result, error) {
 	ownerships, err := cfg.ShardProvider.ShardsForNode(cfg.NodeID)
 	if err != nil {
 		return Result{}, err
@@ -129,12 +178,12 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 	if !ok {
 		return Result{}, fmt.Errorf("eventlog does not support end offset metrics")
 	}
-	shardMetrics, err := buildShardMetrics(context.Background(), cfg.NodeID, shardIDs, offsetReader, checkpointStore, cfg.ShardProvider)
+	shardMetrics, err := buildShardMetrics(ctx, cfg.NodeID, shardIDs, offsetReader, cfg.CheckpointStore, cfg.ShardProvider)
 	if err != nil {
 		return Result{}, err
 	}
 
-	result := Result{
+	return Result{
 		NodeID:        cfg.NodeID,
 		ShardIDs:      shardIDs,
 		EventLogDir:   eventLogDir,
@@ -145,9 +194,7 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 		Missed:        matchingEngine.Missed(),
 		OnlineRiders:  matchingEngine.OnlineRiders(),
 		ShardMetrics:  shardMetrics,
-	}
-
-	return result, nil
+	}, nil
 }
 
 func withDefaults(cfg Config) Config {
@@ -172,6 +219,9 @@ func withDefaults(cfg Config) Config {
 func validateConfig(cfg Config) error {
 	if cfg.ShardProvider == nil {
 		return fmt.Errorf("shard provider is required")
+	}
+	if cfg.CheckpointStore == nil {
+		return fmt.Errorf("checkpoint store is required")
 	}
 	return nil
 }

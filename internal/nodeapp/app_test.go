@@ -17,7 +17,7 @@ func TestRunWithResultReplaysFileEventLogAndUsesCheckpoint(t *testing.T) {
 	dataDir := t.TempDir()
 	codec := &eventlog.JSONEventCodec{}
 	fileEventLog := eventlog.NewFileEventLog(dataDir+"/events", codec)
-	checkpointStore := checkpoint.NewFileStore(dataDir + "/checkpoints")
+	checkpointStore := checkpoint.NewMemoryStore()
 	ownershipStore := newNodeappTestOwnershipStore()
 	if err := ownershipStore.Assign(1, 10); err != nil {
 		t.Fatalf("Assign returned error: %v", err)
@@ -30,6 +30,7 @@ func TestRunWithResultReplaysFileEventLogAndUsesCheckpoint(t *testing.T) {
 		NodeID:          10,
 		ShardProvider:   ownershipStore,
 		DataDir:         dataDir,
+		CheckpointStore: checkpointStore,
 		Riders:          20,
 		Workers:         1,
 		Seed:            1,
@@ -110,7 +111,7 @@ func TestRunWithResultTailProcessesEventAppendedAfterStart(t *testing.T) {
 	dataDir := t.TempDir()
 	codec := &eventlog.JSONEventCodec{}
 	fileEventLog := eventlog.NewFileEventLog(dataDir+"/events", codec)
-	checkpointStore := checkpoint.NewFileStore(dataDir + "/checkpoints")
+	checkpointStore := checkpoint.NewMemoryStore()
 	ownershipStore := newNodeappTestOwnershipStore()
 	if err := ownershipStore.Assign(1, 10); err != nil {
 		t.Fatalf("Assign returned error: %v", err)
@@ -127,6 +128,7 @@ func TestRunWithResultTailProcessesEventAppendedAfterStart(t *testing.T) {
 			NodeID:          10,
 			ShardProvider:   ownershipStore,
 			DataDir:         dataDir,
+			CheckpointStore: checkpointStore,
 			Riders:          20,
 			Workers:         1,
 			Seed:            1,
@@ -206,11 +208,65 @@ func TestRunWithResultUsesInjectedShardCheckpointStore(t *testing.T) {
 	assertShardMetric(t, result.ShardMetrics, 1, 1, 2, 2, 0)
 }
 
+func TestRunWithResultReportsMetricsWhileRunning(t *testing.T) {
+	dataDir := t.TempDir()
+	checkpointStore := checkpoint.NewMemoryStore()
+	ownershipStore := newNodeappTestOwnershipStore()
+	if err := ownershipStore.Assign(1, 10); err != nil {
+		t.Fatalf("Assign returned error: %v", err)
+	}
+
+	metricCh := make(chan Result, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := RunWithResult(ctx, Config{
+			NodeID:          10,
+			ShardProvider:   ownershipStore,
+			DataDir:         dataDir,
+			CheckpointStore: checkpointStore,
+			Riders:          20,
+			Workers:         1,
+			Seed:            1,
+			RefreshInterval: time.Millisecond,
+			MetricsInterval: time.Millisecond,
+			MetricsSink: func(result Result, err error) {
+				if err != nil {
+					t.Errorf("MetricsSink received error: %v", err)
+					return
+				}
+				select {
+				case metricCh <- result:
+				default:
+				}
+			},
+		})
+		errCh <- err
+	}()
+
+	select {
+	case result := <-metricCh:
+		if result.NodeID != 10 {
+			t.Fatalf("metric node id mismatch: got %d, want 10", result.NodeID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for runtime metrics")
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("RunWithResult returned error: %v", err)
+	}
+}
+
 func TestRunWithResultTailConsumesMatchResultEvent(t *testing.T) {
 	dataDir := t.TempDir()
 	codec := &eventlog.JSONEventCodec{}
 	fileEventLog := eventlog.NewFileEventLog(dataDir+"/events", codec)
 	orderStore := orderstate.NewFileStore(dataDir + "/orders")
+	checkpointStore := checkpoint.NewMemoryStore()
 	riderCount := 1
 	cellSize := autoCellSize(defaultAreaSize, riderCount)
 	layout := shard.NewLayout(defaultAreaSize, cellSize, defaultShardCount)
@@ -231,6 +287,7 @@ func TestRunWithResultTailConsumesMatchResultEvent(t *testing.T) {
 			NodeID:          10,
 			ShardProvider:   ownershipStore,
 			DataDir:         dataDir,
+			CheckpointStore: checkpointStore,
 			Riders:          riderCount,
 			Workers:         1,
 			Seed:            1,
@@ -255,11 +312,50 @@ func TestRunWithResultTailConsumesMatchResultEvent(t *testing.T) {
 	}
 }
 
+func TestRunWithResultUsesInjectedOrderStateStore(t *testing.T) {
+	dataDir := t.TempDir()
+	codec := &eventlog.JSONEventCodec{}
+	fileEventLog := eventlog.NewFileEventLog(dataDir+"/events", codec)
+	orderStore := orderstate.NewMemoryStore()
+	checkpointStore := checkpoint.NewMemoryStore()
+	ownershipStore := newNodeappTestOwnershipStore()
+	if err := ownershipStore.Assign(1, 10); err != nil {
+		t.Fatalf("Assign returned error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := RunWithResult(ctx, Config{
+			NodeID:          10,
+			ShardProvider:   ownershipStore,
+			DataDir:         dataDir,
+			CheckpointStore: checkpointStore,
+			OrderStateStore: orderStore,
+			Riders:          20,
+			Workers:         1,
+			Seed:            1,
+			RefreshInterval: time.Millisecond,
+		})
+		errCh <- err
+	}()
+
+	appendOrderCreatedEvent(t, fileEventLog, codec, "event-1", 1, 1)
+	waitForOrderStateStatus(t, orderStore, 1, orderstate.StatusSubmitted)
+	cancel()
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("RunWithResult returned error: %v", err)
+	}
+}
+
 func TestRunWithResultDynamicProviderProcessesShardAssignedAfterStart(t *testing.T) {
 	dataDir := t.TempDir()
 	codec := &eventlog.JSONEventCodec{}
 	fileEventLog := eventlog.NewFileEventLog(dataDir+"/events", codec)
-	checkpointStore := checkpoint.NewFileStore(dataDir + "/checkpoints")
+	checkpointStore := checkpoint.NewMemoryStore()
 	ownershipStore := newNodeappTestOwnershipStore()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -273,6 +369,7 @@ func TestRunWithResultDynamicProviderProcessesShardAssignedAfterStart(t *testing
 			NodeID:          10,
 			ShardProvider:   ownershipStore,
 			DataDir:         dataDir,
+			CheckpointStore: checkpointStore,
 			Riders:          20,
 			Workers:         1,
 			Seed:            1,
@@ -306,11 +403,12 @@ func TestRunWithResultDynamicProviderProcessesShardAssignedAfterStart(t *testing
 
 func TestRunWithResultRequiresShardProvider(t *testing.T) {
 	_, err := RunWithResult(context.Background(), Config{
-		NodeID:  10,
-		DataDir: t.TempDir(),
-		Riders:  20,
-		Workers: 1,
-		Seed:    1,
+		NodeID:          10,
+		DataDir:         t.TempDir(),
+		CheckpointStore: checkpoint.NewMemoryStore(),
+		Riders:          20,
+		Workers:         1,
+		Seed:            1,
 	})
 	if err == nil {
 		t.Fatal("expected RunWithResult to return an error")
@@ -442,6 +540,30 @@ func waitForOrderFinalStatus(t *testing.T, store orderstate.Store, orderID int64
 		select {
 		case <-deadline:
 			t.Fatalf("order state did not reach final status: found=%v state=%+v", found, state)
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForOrderStateStatus(t *testing.T, store orderstate.Store, orderID int64, expected orderstate.Status) {
+	t.Helper()
+
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		state, found, err := store.Load(context.Background(), orderID)
+		if err != nil {
+			t.Fatalf("Load order state returned error: %v", err)
+		}
+		if found && state.Status == expected {
+			return
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("order state status mismatch: found=%v state=%+v want=%q", found, state, expected)
 		case <-ticker.C:
 		}
 	}

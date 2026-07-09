@@ -10,10 +10,10 @@ import (
 	"testing"
 )
 
-func TestRunnerRestartsFromFileCheckpoint(t *testing.T) {
+func TestRunnerRestartsFromSharedCheckpoint(t *testing.T) {
 	baseDir := t.TempDir()
 	eventLog := eventlog.NewFileEventLog(baseDir+"/events", &eventlog.JSONEventCodec{})
-	checkpointStore := checkpoint.NewFileStore(baseDir + "/checkpoints")
+	checkpointStore := checkpoint.NewMemoryStore()
 
 	appendRecoveryEvent(t, eventLog, recoveryEvent("event-1", 1))
 	appendRecoveryEvent(t, eventLog, recoveryEvent("event-2", 1))
