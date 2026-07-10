@@ -135,6 +135,41 @@ func TestRiderOfflineThenOnlineUpdatesMatcherIndexes(t *testing.T) {
 	}
 }
 
+func TestDeactivateShardRemovesItsRidersFromMatching(t *testing.T) {
+	e := NewShardedEngine(nil, 2, 1, 10, 20, 1000)
+	rider := &model.Rider{UID: 1, X: 1, Y: 1}
+	shardID := e.Layout().ShardID(rider.X, rider.Y)
+
+	if err := e.ReplaceShardRiders(shardID, []*model.Rider{rider}); err != nil {
+		t.Fatalf("ReplaceShardRiders returned error: %v", err)
+	}
+	if got := e.OnlineRiders(); got != 1 {
+		t.Fatalf("online riders before deactivate = %d, want 1", got)
+	}
+
+	e.DeactivateShard(shardID)
+
+	if got := e.OnlineRiders(); got != 0 {
+		t.Fatalf("online riders after deactivate = %d, want 0", got)
+	}
+	order := &model.Order{ID: 1, X: rider.X, Y: rider.Y}
+	if got := e.findBestRider(shardID, order); got != nil {
+		t.Fatalf("matched rider after deactivate = %d, want nil", got.UID)
+	}
+}
+
+func TestReplaceShardRidersRejectsRiderFromAnotherShard(t *testing.T) {
+	e := NewShardedEngine(nil, 4, 1, 10, 100, 1000)
+	rider := &model.Rider{UID: 1, X: 99, Y: 99}
+	actualShardID := e.Layout().ShardID(rider.X, rider.Y)
+	wrongShardID := (actualShardID + 1) % 4
+
+	err := e.ReplaceShardRiders(wrongShardID, []*model.Rider{rider})
+	if err == nil {
+		t.Fatal("expected ReplaceShardRiders to reject rider from another shard")
+	}
+}
+
 func TestMatchOneWritesMatchedResult(t *testing.T) {
 	e := newTestShardedEngine([]*model.Rider{
 		{UID: 7, X: 0, Y: 0},

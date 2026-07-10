@@ -37,6 +37,8 @@ type Node struct {
 	provider        clusterownership.ShardProvider
 	metricsRecorder metrics.Recorder
 	refreshInterval time.Duration
+	onShardStart    func(shardID int) error
+	onShardStop     func(shardID int)
 }
 
 type shardWorker struct {
@@ -74,6 +76,11 @@ func (n *Node) SetRefreshInterval(interval time.Duration) {
 
 func (n *Node) SetMetricsRecorder(recorder metrics.Recorder) {
 	n.metricsRecorder = recorder
+}
+
+func (n *Node) SetShardLifecycleHooks(onStart func(shardID int) error, onStop func(shardID int)) {
+	n.onShardStart = onStart
+	n.onShardStop = onStop
 }
 
 func (n *Node) Run(ctx context.Context) error {
@@ -169,6 +176,12 @@ func (n *Node) startShard(
 		cancel()
 		return err
 	}
+	if n.onShardStart != nil {
+		if err := n.onShardStart(ownership.ShardID); err != nil {
+			cancel()
+			return err
+		}
+	}
 
 	n.mu.Lock()
 	n.nextStep[ownership.ShardID] = nextOffset
@@ -179,6 +192,9 @@ func (n *Node) startShard(
 		Offset:  nextOffset,
 	})
 	if err != nil {
+		if n.onShardStop != nil {
+			n.onShardStop(ownership.ShardID)
+		}
 		cancel()
 		return err
 	}
@@ -196,7 +212,9 @@ func (n *Node) startShard(
 		//如果fence失败，说明节点落后了，删除shard退出等待controller重新分配
 		if errors.Is(err, clusterownership.ErrOwnershipFenceLost) {
 			n.recordFencingReject(ownership.ShardID)
-			n.removeActiveShardIfEpochMatches(ownership.ShardID, ownership.Epoch)
+			if n.removeActiveShardIfEpochMatches(ownership.ShardID, ownership.Epoch) && n.onShardStop != nil {
+				n.onShardStop(ownership.ShardID)
+			}
 			return
 		}
 		if errors.Is(err, context.Canceled) {
@@ -291,19 +309,20 @@ func (n *Node) checkShardFence(shardID int, epoch int64) error {
 
 	return nil
 }
-func (n *Node) removeActiveShardIfEpochMatches(shardID int, epoch int64) {
+func (n *Node) removeActiveShardIfEpochMatches(shardID int, epoch int64) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	worker, ok := n.active[shardID]
 	if !ok {
-		return
+		return false
 	}
 	if worker.epoch != epoch {
-		return
+		return false
 	}
 
 	delete(n.active, shardID)
+	return true
 }
 
 func (n *Node) stopShard(shardID int) {
@@ -316,6 +335,9 @@ func (n *Node) stopShard(shardID int) {
 	//优雅退出shardWorker
 	if ok && worker.cancel != nil {
 		worker.cancel()
+	}
+	if ok && n.onShardStop != nil {
+		n.onShardStop(shardID)
 	}
 }
 

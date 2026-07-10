@@ -17,6 +17,7 @@ import (
 	"testP/internal/model"
 	"testP/internal/node"
 	"testP/internal/orderstate"
+	"testP/internal/shard"
 	"time"
 )
 
@@ -89,9 +90,8 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 	}
 
 	cellSize := autoCellSize(defaultAreaSize, cfg.Riders)
-	riders := generateRiders(rand.New(rand.NewSource(cfg.Seed)), cfg.Riders, defaultAreaSize)
 	matchingEngine := engine.NewShardedEngine(
-		riders,
+		nil,
 		defaultShardCount,
 		defaultBufferSize,
 		cellSize,
@@ -119,6 +119,13 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 	runner := node.NewRunner(cfg.NodeID, cfg.ShardProvider, activeEventLog, eventApplier, cfg.CheckpointStore)
 	runner.SetRefreshInterval(cfg.RefreshInterval)
 	runner.SetMetricsRecorder(cfg.MetricsRecorder)
+	runner.SetShardLifecycleHooks(
+		func(shardID int) error {
+			riders := generateRidersForShard(cfg.Seed, cfg.Riders, defaultAreaSize, matchingEngine.Layout(), shardID)
+			return matchingEngine.ReplaceShardRiders(shardID, riders)
+		},
+		matchingEngine.DeactivateShard,
+	)
 
 	if cfg.MetricsSink != nil && cfg.MetricsInterval > 0 {
 		go reportMetrics(ctx, cfg, activeEventLog, matchingEngine, eventLogDir, checkpointDir, orderStateDir)
@@ -385,17 +392,20 @@ func (s *matchResultEventSink) buildMissedEvent(result engine.MatchResult) (mode
 	}, nil
 }
 
-func generateRiders(rng *rand.Rand, count int, areaSize int) []*model.Rider {
-	riders := make([]*model.Rider, 0, count)
-
-	for i := 0; i < count; i++ {
-		riders = append(riders, &model.Rider{
-			UID: int64(i + 1),
-			X:   rng.Intn(areaSize),
-			Y:   rng.Intn(areaSize),
-		})
+func generateRidersForShard(seed int64, count int, areaSize int, layout shard.Layout, shardID int) []*model.Rider {
+	rng := rand.New(rand.NewSource(seed))
+	riders := make([]*model.Rider, 0)
+	for index := 0; index < count; index++ {
+		x := rng.Intn(areaSize)
+		y := rng.Intn(areaSize)
+		if layout.ShardID(x, y) == shardID {
+			riders = append(riders, &model.Rider{
+				UID: int64(index + 1),
+				X:   x,
+				Y:   y,
+			})
+		}
 	}
-
 	return riders
 }
 

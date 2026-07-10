@@ -60,7 +60,7 @@ func TestSweepKeepsOwnershipAfterLeaderSwitch(t *testing.T) {
 		t.Fatalf("NewEtcdElection returned error: %v", err)
 	}
 
-	Sweep(context.Background(), ownershipStore, membershipStore, failoverController, firstElection, 6)
+	sweepWithMetrics(context.Background(), ownershipStore, membershipStore, failoverController, nil, firstElection, 6, "", nil, nil, nil)
 	before := mustListOwnerships(t, ownershipStore)
 	if len(before) != 6 {
 		t.Fatalf("ownership count mismatch: got %d, want 6", len(before))
@@ -70,7 +70,7 @@ func TestSweepKeepsOwnershipAfterLeaderSwitch(t *testing.T) {
 		t.Fatalf("Resign returned error: %v", err)
 	}
 
-	Sweep(context.Background(), ownershipStore, membershipStore, failoverController, secondElection, 6)
+	sweepWithMetrics(context.Background(), ownershipStore, membershipStore, failoverController, nil, secondElection, 6, "", nil, nil, nil)
 	after := mustListOwnerships(t, ownershipStore)
 	if !reflect.DeepEqual(after, before) {
 		t.Fatalf("ownership changed after leader switch:\nbefore=%+v\nafter=%+v", before, after)
@@ -92,14 +92,14 @@ func TestSweepRecoversAfterEtcdTemporarilyUnavailable(t *testing.T) {
 	if err := membershipStore.MarkAlive(1); err != nil {
 		t.Fatalf("MarkAlive returned error: %v", err)
 	}
-	Sweep(context.Background(), ownershipStore, membershipStore, failoverController, leaderElection, 4)
+	sweepWithMetrics(context.Background(), ownershipStore, membershipStore, failoverController, nil, leaderElection, 4, "", nil, nil, nil)
 	before := mustListOwnerships(t, ownershipStore)
 	if len(before) != 4 {
 		t.Fatalf("ownership count mismatch: got %d, want 4", len(before))
 	}
 
 	etcd.stop()
-	Sweep(context.Background(), ownershipStore, membershipStore, failoverController, leaderElection, 4)
+	sweepWithMetrics(context.Background(), ownershipStore, membershipStore, failoverController, nil, leaderElection, 4, "", nil, nil, nil)
 
 	client.Close()
 	time.Sleep(1200 * time.Millisecond)
@@ -117,7 +117,7 @@ func TestSweepRecoversAfterEtcdTemporarilyUnavailable(t *testing.T) {
 		t.Fatalf("MarkAlive after restart returned error: %v", err)
 	}
 
-	Sweep(context.Background(), recoveredOwnershipStore, recoveredMembershipStore, recoveredFailoverController, recoveredElection, 4)
+	sweepWithMetrics(context.Background(), recoveredOwnershipStore, recoveredMembershipStore, recoveredFailoverController, nil, recoveredElection, 4, "", nil, nil, nil)
 	after := mustListOwnerships(t, recoveredOwnershipStore)
 	if !reflect.DeepEqual(after, before) {
 		t.Fatalf("ownership changed after etcd recovery:\nbefore=%+v\nafter=%+v", before, after)

@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -24,6 +27,9 @@ type KafkaEventLog struct {
 	codec    EventCodec
 	maxBytes int
 	maxWait  time.Duration
+	dialer   *kafka.Dialer
+	writer   *kafka.Writer
+	closeMu  sync.Mutex
 }
 
 func NewKafkaEventLog(cfg KafkaConfig) (*KafkaEventLog, error) {
@@ -43,12 +49,27 @@ func NewKafkaEventLog(cfg KafkaConfig) (*KafkaEventLog, error) {
 		cfg.MaxWait = time.Second
 	}
 
+	dialer := &kafka.Dialer{
+		Resolver: localhostResolver{},
+	}
+
 	return &KafkaEventLog{
 		brokers:  append([]string(nil), cfg.Brokers...),
 		topic:    cfg.Topic,
 		codec:    cfg.Codec,
 		maxBytes: cfg.MaxBytes,
 		maxWait:  cfg.MaxWait,
+		dialer:   dialer,
+		writer: &kafka.Writer{
+			Addr:         kafka.TCP(cfg.Brokers...),
+			Topic:        cfg.Topic,
+			Balancer:     shardIDBalancer{},
+			BatchSize:    1,
+			BatchTimeout: 10 * time.Millisecond,
+			Transport: &kafka.Transport{
+				Dial: localKafkaDial,
+			},
+		},
 	}, nil
 }
 
@@ -60,29 +81,37 @@ func (l *KafkaEventLog) Append(ctx context.Context, event model.Event) (Position
 		return Position{}, fmt.Errorf("shard id must be >= 0: %d", event.ShardID)
 	}
 
-	conn, err := kafka.DialLeader(ctx, "tcp", l.brokers[0], l.topic, event.ShardID)
-	if err != nil {
-		return Position{}, fmt.Errorf("dial kafka leader: %w", err)
-	}
-	defer conn.Close()
-
-	offset, err := conn.ReadLastOffset()
-	if err != nil {
-		return Position{}, fmt.Errorf("read kafka last offset: %w", err)
-	}
-
 	message, err := l.encodeMessage(event)
 	if err != nil {
 		return Position{}, err
 	}
-	if _, err := conn.WriteMessages(message); err != nil {
+
+	l.closeMu.Lock()
+	writer := l.writer
+	l.closeMu.Unlock()
+	if writer == nil {
+		return Position{}, fmt.Errorf("kafka eventlog is closed")
+	}
+	if err := writer.WriteMessages(ctx, message); err != nil {
 		return Position{}, fmt.Errorf("write kafka message: %w", err)
 	}
 
 	return Position{
 		ShardID: event.ShardID,
-		Offset:  offset,
+		Offset:  -1,
 	}, nil
+}
+
+func (l *KafkaEventLog) Close() error {
+	l.closeMu.Lock()
+	defer l.closeMu.Unlock()
+
+	if l.writer == nil {
+		return nil
+	}
+	err := l.writer.Close()
+	l.writer = nil
+	return err
 }
 
 func (l *KafkaEventLog) ReadFrom(ctx context.Context, position Position) (<-chan Record, error) {
@@ -185,7 +214,7 @@ func (l *KafkaEventLog) EndOffset(ctx context.Context, shardID int) (int64, erro
 		return 0, fmt.Errorf("shard id must be >= 0: %d", shardID)
 	}
 
-	conn, err := kafka.DialLeader(ctx, "tcp", l.brokers[0], l.topic, shardID)
+	conn, err := l.dialer.DialLeader(ctx, "tcp", l.brokers[0], l.topic, shardID)
 	if err != nil {
 		return 0, fmt.Errorf("dial kafka leader: %w", err)
 	}
@@ -206,7 +235,7 @@ func (l *KafkaEventLog) encodeMessage(event model.Event) (kafka.Message, error) 
 	}
 
 	return kafka.Message{
-		Key:   []byte(event.ID),
+		Key:   []byte(fmt.Sprintf("%d", event.ShardID)),
 		Value: value,
 	}, nil
 }
@@ -235,5 +264,44 @@ func (l *KafkaEventLog) newReader(shardID int) *kafka.Reader {
 		MinBytes:  1,
 		MaxBytes:  l.maxBytes,
 		MaxWait:   l.maxWait,
+		Dialer:    l.dialer,
 	})
+}
+
+type localhostResolver struct{}
+
+func (localhostResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
+	if host == "localhost" {
+		return []string{"127.0.0.1"}, nil
+	}
+	return net.DefaultResolver.LookupHost(ctx, host)
+}
+
+type shardIDBalancer struct{}
+
+func (shardIDBalancer) Balance(message kafka.Message, partitions ...int) int {
+	if len(partitions) == 0 {
+		return 0
+	}
+	shardID, err := strconv.Atoi(string(message.Key))
+	if err != nil {
+		return partitions[0]
+	}
+	for _, partition := range partitions {
+		if partition == shardID {
+			return partition
+		}
+	}
+	return partitions[0]
+}
+
+func localKafkaDial(ctx context.Context, network string, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err == nil && host == "localhost" {
+		address = net.JoinHostPort("127.0.0.1", port)
+	}
+	return (&net.Dialer{
+		Timeout:   3 * time.Second,
+		DualStack: true,
+	}).DialContext(ctx, network, address)
 }

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -19,7 +20,9 @@ type ShardedEngine struct {
 	//存储rider处于哪个shard
 	riderShard map[int64]int
 	//mutex只用于riderEvent的匹配，目前并不是性能瓶颈(详见benchmark)故先将就让事件用全局锁了
-	mu sync.Mutex
+	mu sync.RWMutex
+	// activeShards 限制匹配仅限于该节点当前拥有的分片
+	activeShards []bool
 	//指标
 	metrics    *Metrics
 	resultSink MatchResultSink
@@ -57,20 +60,80 @@ func NewShardedEngine(riders []*model.Rider, shardCount int, bufferSize int, cel
 	}
 	//初始化shard
 	shards := make([]*Shard, shardCount)
+	activeShards := make([]bool, shardCount)
 	for shardID := 0; shardID < shardCount; shardID++ {
 		shards[shardID] = &Shard{
 			id:      shardID,
 			orderCh: make(chan model.ShardOrderBatch, bufferSize),
 			matcher: matcher.NewMatcher(ridersByShard[shardID], cellSize, loadWeight),
 		}
+		activeShards[shardID] = true
 	}
 
 	return &ShardedEngine{
-		layout:      layout,
-		shards:      shards,
-		ridersByUID: ridersByUID,
-		riderShard:  riderShard,
-		metrics:     &Metrics{},
+		layout:       layout,
+		shards:       shards,
+		ridersByUID:  ridersByUID,
+		riderShard:   riderShard,
+		activeShards: activeShards,
+		metrics:      &Metrics{},
+	}
+}
+
+// ReplaceShardRiders 激活该节点拥有的骑手所在的一个分片
+func (e *ShardedEngine) ReplaceShardRiders(shardID int, riders []*model.Rider) error {
+	if shardID < 0 || shardID >= len(e.shards) {
+		return fmt.Errorf("shard id out of range: %d", shardID)
+	}
+	for _, rider := range riders {
+		if rider == nil {
+			continue
+		}
+		if actualShardID := e.layout.ShardID(rider.X, rider.Y); actualShardID != shardID {
+			return fmt.Errorf("rider %d belongs to shard %d, not shard %d", rider.UID, actualShardID, shardID)
+		}
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.removeShardRidersLocked(shardID)
+	for _, rider := range riders {
+		if rider == nil {
+			continue
+		}
+
+		e.shards[shardID].matcher.AddRider(rider)
+		e.ridersByUID[rider.UID] = rider
+		e.riderShard[rider.UID] = shardID
+	}
+	e.activeShards[shardID] = true
+	return nil
+}
+
+// DeactivateShard 移除该节点失去所有权后的本地骑手状态
+func (e *ShardedEngine) DeactivateShard(shardID int) {
+	if shardID < 0 || shardID >= len(e.shards) {
+		return
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.removeShardRidersLocked(shardID)
+	e.activeShards[shardID] = false
+}
+
+func (e *ShardedEngine) removeShardRidersLocked(shardID int) {
+	for riderID, currentShardID := range e.riderShard {
+		if currentShardID != shardID {
+			continue
+		}
+
+		rider := e.ridersByUID[riderID]
+		e.shards[shardID].matcher.DeleteRider(rider)
+		delete(e.riderShard, riderID)
+		delete(e.ridersByUID, riderID)
 	}
 }
 
@@ -172,8 +235,14 @@ func (e *ShardedEngine) Missed() int64 {
 }
 
 func (e *ShardedEngine) OnlineRiders() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	total := 0
-	for _, shard := range e.shards {
+	for shardID, shard := range e.shards {
+		if !e.activeShards[shardID] {
+			continue
+		}
 		total += shard.matcher.OnlineRiders()
 	}
 	return total
@@ -230,8 +299,15 @@ func (e *ShardedEngine) matchBatch(homeShardID int, batch model.ShardOrderBatch)
 
 // 匹配单个订单
 func (e *ShardedEngine) matchOne(homeShardID int, order *model.Order) {
+	e.mu.RLock()
+	if homeShardID < 0 || homeShardID >= len(e.shards) || !e.activeShards[homeShardID] {
+		e.mu.RUnlock()
+		return
+	}
+
 	best := e.findBestRider(homeShardID, order)
 	if best == nil {
+		e.mu.RUnlock()
 		e.metrics.Missed.Add(1)
 		e.saveMatchResult(MatchResult{
 			OrderID: order.ID,
@@ -242,6 +318,7 @@ func (e *ShardedEngine) matchOne(homeShardID int, order *model.Order) {
 	}
 
 	atomic.AddInt64(&best.Count, 1)
+	e.mu.RUnlock()
 	e.metrics.Matched.Add(1)
 	e.saveMatchResult(MatchResult{
 		OrderID: order.ID,
@@ -295,6 +372,9 @@ func (e *ShardedEngine) bestRiderInShards(shardIDs []int, order *model.Order, in
 	scorer := e.shards[0].matcher
 
 	for _, shardID := range shardIDs {
+		if !e.activeShards[shardID] {
+			continue
+		}
 		candidate := e.shards[shardID].matcher.BestNearbyRiderInRange(order, innerRadius, outerRadius)
 		best = scorer.BetterRider(order, best, candidate)
 	}

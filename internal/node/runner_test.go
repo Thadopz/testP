@@ -90,6 +90,41 @@ func TestDynamicRunnerRefreshOnceStopsRemovedShard(t *testing.T) {
 	}
 }
 
+func TestDynamicRunnerRefreshOnceRunsShardLifecycleHooks(t *testing.T) {
+	provider := newFakeShardProvider([]clusterownership.Ownership{
+		{ShardID: 1, NodeID: 10, Epoch: 1},
+	})
+	runner := NewRunner(10, provider, newDynamicTailFakeEventLog(), &fakeApplier{}, nil)
+
+	started := make(chan int, 1)
+	stopped := make(chan int, 1)
+	runner.SetShardLifecycleHooks(
+		func(shardID int) error {
+			started <- shardID
+			return nil
+		},
+		func(shardID int) {
+			stopped <- shardID
+		},
+	)
+
+	errCh := make(chan error, 1)
+	if err := runner.refreshOnce(context.Background(), errCh); err != nil {
+		t.Fatalf("first refreshOnce returned error: %v", err)
+	}
+	if got := <-started; got != 1 {
+		t.Fatalf("started shard = %d, want 1", got)
+	}
+
+	provider.setOwnerships(nil)
+	if err := runner.refreshOnce(context.Background(), errCh); err != nil {
+		t.Fatalf("second refreshOnce returned error: %v", err)
+	}
+	if got := <-stopped; got != 1 {
+		t.Fatalf("stopped shard = %d, want 1", got)
+	}
+}
+
 func TestDynamicRunnerRefreshOnceRestartsShardWhenEpochChanges(t *testing.T) {
 	provider := newFakeShardProvider([]clusterownership.Ownership{
 		{ShardID: 1, NodeID: 10, Epoch: 1},

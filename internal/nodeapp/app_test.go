@@ -420,7 +420,34 @@ func TestRunWithResultRequiresShardProvider(t *testing.T) {
 	}
 }
 
+func TestGenerateRidersForShardPartitionsRidersWithoutDuplicates(t *testing.T) {
+	const riderCount = 100
+	const seed = int64(7)
+	layout := shard.NewLayout(defaultAreaSize, autoCellSize(defaultAreaSize, riderCount), defaultShardCount)
+
+	seen := make(map[int64]int)
+	for shardID := 0; shardID < defaultShardCount; shardID++ {
+		riders := generateRidersForShard(seed, riderCount, defaultAreaSize, layout, shardID)
+		for _, rider := range riders {
+			if got := layout.ShardID(rider.X, rider.Y); got != shardID {
+				t.Fatalf("rider %d belongs to shard %d, returned for shard %d", rider.UID, got, shardID)
+			}
+			seen[rider.UID]++
+		}
+	}
+
+	if len(seen) != riderCount {
+		t.Fatalf("unique rider count = %d, want %d", len(seen), riderCount)
+	}
+	for riderID, occurrences := range seen {
+		if occurrences != 1 {
+			t.Fatalf("rider %d appears %d times, want 1", riderID, occurrences)
+		}
+	}
+}
+
 type nodeappTestOwnershipStore struct {
+	mu     sync.RWMutex
 	owners map[int]clusterownership.Ownership
 }
 
@@ -431,11 +458,17 @@ func newNodeappTestOwnershipStore() *nodeappTestOwnershipStore {
 }
 
 func (s *nodeappTestOwnershipStore) OwnerOf(shardID int) (clusterownership.Ownership, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	ownership, ok := s.owners[shardID]
 	return ownership, ok, nil
 }
 
 func (s *nodeappTestOwnershipStore) ShardsForNode(nodeID int) ([]clusterownership.Ownership, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	ownerships := make([]clusterownership.Ownership, 0)
 	for _, ownership := range s.owners {
 		if ownership.NodeID == nodeID {
@@ -449,6 +482,9 @@ func (s *nodeappTestOwnershipStore) ShardsForNode(nodeID int) ([]clusterownershi
 }
 
 func (s *nodeappTestOwnershipStore) Assign(shardID int, nodeID int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	ownership := s.owners[shardID]
 	ownership.ShardID = shardID
 	ownership.NodeID = nodeID

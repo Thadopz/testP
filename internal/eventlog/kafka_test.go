@@ -49,6 +49,9 @@ func TestKafkaEventLogEncodesAndDecodesMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encodeMessage returned error: %v", err)
 	}
+	if string(message.Key) != "3" {
+		t.Fatalf("message key mismatch: got %q, want shard id key 3", string(message.Key))
+	}
 	message.Offset = 7
 
 	record, err := eventLog.decodeMessage(3, message)
@@ -61,6 +64,26 @@ func TestKafkaEventLogEncodesAndDecodesMessage(t *testing.T) {
 	}
 	if record.Event.ID != event.ID || record.Event.Type != event.Type || record.Event.ShardID != 3 {
 		t.Fatalf("event mismatch: got %+v", record.Event)
+	}
+}
+
+func TestShardIDBalancerUsesMessageKeyAsPartition(t *testing.T) {
+	partition := shardIDBalancer{}.Balance(kafka.Message{
+		Key: []byte("3"),
+	}, 0, 1, 2, 3)
+
+	if partition != 3 {
+		t.Fatalf("partition mismatch: got %d, want 3", partition)
+	}
+}
+
+func TestShardIDBalancerFallsBackWhenKeyIsInvalid(t *testing.T) {
+	partition := shardIDBalancer{}.Balance(kafka.Message{
+		Key: []byte("not-a-shard"),
+	}, 2, 3)
+
+	if partition != 2 {
+		t.Fatalf("partition mismatch: got %d, want first partition 2", partition)
 	}
 }
 
