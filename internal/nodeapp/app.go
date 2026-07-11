@@ -113,7 +113,7 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 
 	eventApplier := applier.NewEventApplierWithOrderStore(codec, matchingEngine, orderStateStore)
 	if reader, ok := cfg.ShardProvider.(applier.OwnershipReader); ok {
-		eventApplier = applier.NewFencedEventApplierWithOrderStore(codec, matchingEngine, cfg.NodeID, reader, orderStateStore)
+		eventApplier = applier.NewFencedEventApplier(codec, matchingEngine, cfg.NodeID, reader, orderStateStore)
 	}
 
 	runner := node.NewRunner(cfg.NodeID, cfg.ShardProvider, activeEventLog, eventApplier, cfg.CheckpointStore)

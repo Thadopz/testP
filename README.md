@@ -2,34 +2,93 @@
 
 这是一个用 Go 编写的订单与骑手匹配模拟项目，用于验证在不同骑手规模、订单规模和运行时长约束下，系统能否持续生成订单并完成分配。
 
-项目从先前的单机订单匹配 benchmark 出发，在分布式方向上进行了拓展：事件日志、分片拥有权、持久化、节点故障切换和可观测指标等功能，还有一些一致性与幂等还在实现中。
+项目从先前的单机订单匹配 benchmark 出发，在分布式方向上进行了拓展：事件日志、分片拥有权、持久化、节点故障切换和可观测指标等功能，还有一些一致性与幂等问题还在完善中。
 
-其中核心逻辑先由我个人手写实现，AI 参与了后续优化工作，主要内容如下：
+## 设计目标
 
-- 设计事件字段 `Event`、事件日志 `EventLog`。
-- 拥有权 `ownership`、持久化 `checkpoint`、存活检测 `membership`：
-  - `ownership` 是一个三元组 `(shard, node, epoch)`，表示某个 shard 由哪个 node 在当前 epoch 拥有。
-  - `checkpoint` 记录了某一时刻下日志的 Offset、epoch 以及 shard-node 对，表示某个 shard 已经处理到哪个事件位置。
-  - `membership` 是一个接口，定义了检验节点是否存活的动作。
-- 划分 `node`、`controller` 职责：
-  - `controller` 负责维护 shard ownership，节点心跳失效后重新分配 shard。
-  - `node` 负责消费自己持有的 shard 并应用事件。
-- 节点保活：
-  - 节点故障后让 shard 进行迁移，但是对于已经执行了操作后在持久化保存时宕机的情况，不加入事务锁可能会在其他 node 接手后进行重复操作。后面设计了 `orderState` 给正在进行持久化动作时标记 node 状态为 pending，但是意识到就算如此也要考虑标记过程是否也会宕机，可能这个问题不使用事务很难去进行一个完全的处理。
-- 事件应用前后使用 fencing 校验，防止脏写入：具体而言就是维护一个版本号 epoch，更新 shard 归属时就会自增，类似 CAS 的思路。
-- Controller 的一部分高可用能力：
-  - 通过 etcd 的租约以及事务锁，保证唯一 leader 的存在。在接入 etcd 前手动写了一个 raft 的简单实现，第二天起来给节点接入 etcd 时忘记这回事了，重新写的时候又觉得我直接用 etcd 不就好了...
-- 节点负载均衡：
-  - 使用一致性哈希分配 shard，默认一个 node 在哈希环上有 32 份，不过因为 shard 太少（64 个）可能会导致分布效果有点平庸。
+把原来的单机匹配程序扩展为一条分布式订单处理链路：订单和骑手的状态变化被包装为事件，不同`node`按`shard`分担消费任务，并且通过共享的事件日志和协调存储协同工作。
 
+初步规划中主要解决以下问题：
 
-主要写了事件从生成到分配到对应节点处理的整个流程，并从内存态实现转移到文件态实现，最后调用中间件完成最终实现。（由于先抽出接口写了内存实现和文件实现来验证能不能跑起来，所以项目中存在不少懒加载默认是加载内存或者文件实现。）
+1. 任务的拆分：将订单映射到`shard`，每个 `node` 只处理自己拥有的 `shard`，避免所有节点竞争同一份数据。
+2. 故障处理以及转移：`node` 失效后，`controller` 将其` shard `迁移给存活节点；旧`node`恢复后不能继续写入已经失去拥有权（ownership）的`shard`。
+3. 进度恢复：为每个 shard 保存 checkpoint，使新 owner 能从上次处理位置继续消费。
+4. 控制器高可用：允许启动多个 controller，但通过raft的leader election保证同一时间只有一个`controller`修改ownership。
+5. 负载均衡：使用一致性哈希规划shard归属，并在节点变化时逐步再平衡。
 
-其中 AI 给出了一部分修改意见，并且对项目进行了重构与测试，接管了测试、指标收集和可观测性的构造。
+## 核心对象与不变量
 
-初步跑通功能后逐步替换为中间件实现，比如使用 Kafka 作为事件日志，etcd 作为分布式协调和持久化存储，顺便用来做Controller的选举制度，使用 Prometheus/Grafana 作为可观测指标和告警（这部分是 AI 构造的）。
+核心对象包括：
 
+- `Order`：待匹配的订单；
+- `Rider`：可参与匹配的骑手；
+- `Event`：订单或骑手状态变化；
+- `Shard`：事件和处理责任的分区；
+- `Ownership`：当前 shard 的合法处理者；
+- `Checkpoint`：记录该 shard 下一条待处理事件的位置；
+- `Membership`：描述 node 是否仍然存活。
 
+系统希望维持的不变量：
+
+- 同一时刻一个 `shard` 只有一个合法 `owner`；
+- `shard ownership` 每次变更都增加 `epoch`；
+- 同一个 `shard` 内事件按 `offset` 顺序处理；
+- 事件成功应用后才能推进 `checkpoint`；
+- 旧 `epoch` 的 `node` 不允许继续写入；
+- 同一订单事件重复消费时，结果应尽量保持幂等。
+
+## 实现思路
+
+### 1. 单机匹配要转移到事件驱动
+
+项目最初只有单机匹配器和benchmark，之后将订单、骑手的变化统一建模为 `Event`。事件包括订单创建、取消、重试、匹配成功、匹配失败，以及骑手上线、移动和下线。
+
+`EventLog` 抽象出三个动作：`Append` 追加事件，`TailFrom` 从指定 offset 持续读取日志，`EndOffset` 用来获取 shard 的日志末尾位置。一开始是使用内存和文件实现验证流程，分布式运行时再调Kafka实现。业务shard与Kafka partition按编号对应，从而保留同一shard内的事件顺序。
+
+### 2. 划分控制面与数据面
+
+- `controller` 属于控制面，负责leader election、读取membership、初始化ownership，以及执行故障转移failover和rebalance。
+- `node` 属于数据面，负责发送心跳、读取自己拥有的shard、加载checkpoint，并为每个shard启动事件消费任务（后续被shardworker整体封装）。
+
+多个 controller 可以同时运行，但只有etcd选出的leader可以修改ownership。node定期通过带 TTL 的membership续租；心跳过期后，controller 会把故障节点的 shard 迁移给其他存活节点。
+
+### 3. 解码与应用事件
+
+`Codec`只负责事件的编码和解码，`Applier` 负责把事件转换成业务动作。例如`order_created` 会被转换为 `engine.SubmitBatch()`，订单结果则更新到order state。拆分这两个职责后，事件格式、日志实现和匹配逻辑就可以分别测试了。
+
+### 4. Ownership、checkpoint 与 fencing
+
+`Ownership` 是一个三元组 `(shard, node, epoch)`。etcd 使用 CAS 方式更新 ownership，每次分配都会增加 epoch。shard worker 启动时保存自己取得的 epoch，并在应用事件前后与 etcd 中的当前 ownership 比较；如果 node 或 epoch 已发生变化，则旧 worker 停止处理。
+
+事件应用成功后，node 才会推进 checkpoint。节点重启或 shard 迁移时，新 owner 从 checkpoint 记录的 offset 继续消费。因此当前处理语义接近 at-least-once：如果 node 在 apply 之后、checkpoint 保存之前宕机，同一事件可能会被再次执行，这一点需要DB提供事务锁，但是引入DB又要处理与消息队列之前天然不能构成事务的矛盾，同时对性能也有一定的影响。
+
+前后两次fencing校验可以发现ownership已经变化，但不能撤销检查之间已经发生的副作用。order state、匹配动作和 checkpoint 目前也不在同一个事务中，所以 `LastEventID` 只能提供有限的重复识别能力，还是要落到幂等表做乐观锁。
+
+### 5. 分片匹配与负载均衡
+
+订单首先在坐标对应的 home shard 中查找骑手；如果没有合适候选者，matching engine 会访问预先计算的邻居 shard，并逐步扩大搜索半径，综合距离与骑手负载选择结果。
+
+当前跨 shard 搜索发生在同一 node 进程内，打算是做跨节点 RPC，后续可以让各shard owner提供候选查询和条件预约接口：先并行收集 TopK 候选，再按顺序尝试原子预约，骑手设置一个订单上限，类似一个带缓冲区的channel吧，满了就阻塞。
+
+shard 默认通过一致性哈希分配给存活节点，每个 node 在哈希环上使用 32 个虚拟节点。当前只有 64 个 shard，节点数量较少时分布仍可能不够均匀，导致效果有点平庸。
+
+### 6. 实现演进与当前边界
+
+项目是逐步演进的：
+
+单机匹配器
+做分片匹配引擎
+事件日志与回放
+checkpoint 恢复
+node/controller 职责拆分
+membership 与故障转移
+ownership epoch 与 fencing
+Kafka、etcd 和可观测性
+改进单机匹配器，与分布式适配（主要是先前是直接在单机内生成骑手的，导致每一个engine里都有固定的骑手）
+
+当前仍有很多重要边界：order state 暂时存储在 etcd 中；骑手和匹配状态主要位于 node 内存；Kafka 消费重试、无法解码事件和死信队列还没想好怎么写；controller shard 数、matching engine shard 数与 Kafka partition 数也需要由使用者保持一致，有一些地方图省事写了些魔法数字，以及硬编码了一致性哈希的初始份数。
+
+核心匹配逻辑以及核心的对象最初由手打实现，后续借助 AI 完成了部分重构、测试、指标收集和可观测性配置，完成docker compose以及相关yaml的编写，在思路上也有一定的纠正与指导。
 
 ## 当前能力
 

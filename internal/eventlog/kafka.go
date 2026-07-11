@@ -9,8 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/segmentio/kafka-go"
 	"testP/internal/model"
+
+	"github.com/segmentio/kafka-go"
 )
 
 type KafkaConfig struct {
@@ -81,7 +82,7 @@ func (l *KafkaEventLog) Append(ctx context.Context, event model.Event) (Position
 		return Position{}, fmt.Errorf("shard id must be >= 0: %d", event.ShardID)
 	}
 
-	message, err := l.encodeMessage(event)
+	msg, err := l.encodeMessage(event)
 	if err != nil {
 		return Position{}, err
 	}
@@ -92,7 +93,7 @@ func (l *KafkaEventLog) Append(ctx context.Context, event model.Event) (Position
 	if writer == nil {
 		return Position{}, fmt.Errorf("kafka eventlog is closed")
 	}
-	if err := writer.WriteMessages(ctx, message); err != nil {
+	if err := writer.WriteMessages(ctx, msg); err != nil {
 		return Position{}, fmt.Errorf("write kafka message: %w", err)
 	}
 
@@ -113,58 +114,6 @@ func (l *KafkaEventLog) Close() error {
 	l.writer = nil
 	return err
 }
-
-func (l *KafkaEventLog) ReadFrom(ctx context.Context, position Position) (<-chan Record, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	endOffset, err := l.EndOffset(ctx, position.ShardID)
-	if err != nil {
-		return nil, err
-	}
-	if position.Offset >= endOffset {
-		recordCh := make(chan Record)
-		close(recordCh)
-		return recordCh, nil
-	}
-
-	reader := l.newReader(position.ShardID)
-	if err := reader.SetOffset(position.Offset); err != nil {
-		reader.Close()
-		return nil, fmt.Errorf("set kafka offset: %w", err)
-	}
-
-	recordCh := make(chan Record)
-	go func() {
-		defer close(recordCh)
-		defer reader.Close()
-
-		for {
-			message, err := reader.FetchMessage(ctx)
-			if err != nil {
-				return
-			}
-			if message.Offset >= endOffset {
-				return
-			}
-
-			record, err := l.decodeMessage(position.ShardID, message)
-			if err != nil {
-				return
-			}
-
-			select {
-			case <-ctx.Done():
-				return
-			case recordCh <- record:
-			}
-		}
-	}()
-
-	return recordCh, nil
-}
-
 func (l *KafkaEventLog) TailFrom(ctx context.Context, position Position) (<-chan Record, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -270,6 +219,7 @@ func (l *KafkaEventLog) newReader(shardID int) *kafka.Reader {
 
 type localhostResolver struct{}
 
+// 避免出现妙妙转义导致localhost变成::1,kafka只监听ipv4的地址
 func (localhostResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
 	if host == "localhost" {
 		return []string{"127.0.0.1"}, nil
@@ -295,6 +245,7 @@ func (shardIDBalancer) Balance(message kafka.Message, partitions ...int) int {
 	return partitions[0]
 }
 
+// 同lookupHost
 func localKafkaDial(ctx context.Context, network string, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err == nil && host == "localhost" {

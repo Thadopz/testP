@@ -37,6 +37,60 @@ func TestParseEtcdEndpointsRejectsEmptyInput(t *testing.T) {
 	}
 }
 
+func TestEnsureInitialOwnershipFillsMissingShardsWithoutChangingExistingOwner(t *testing.T) {
+	client := startControllerEtcd(t)
+	prefix := "/test-controller-fill-missing-ownership"
+	ownershipStore := ownership.NewEtcdOwnershipStore(client, prefix)
+	membershipStore := membership.NewEtcdMembershipStore(client, prefix)
+
+	for _, nodeID := range []int{1, 2} {
+		if err := membershipStore.MarkAlive(nodeID); err != nil {
+			t.Fatalf("MarkAlive returned error: %v", err)
+		}
+	}
+	if err := ownershipStore.Assign(0, 2); err != nil {
+		t.Fatalf("Assign existing ownership returned error: %v", err)
+	}
+
+	if err := EnsureInitialOwnership(ownershipStore, membershipStore, 4); err != nil {
+		t.Fatalf("EnsureInitialOwnership returned error: %v", err)
+	}
+
+	ownerships := mustListOwnerships(t, ownershipStore)
+	if len(ownerships) != 4 {
+		t.Fatalf("ownership count = %d, want 4", len(ownerships))
+	}
+
+	existing, found, err := ownershipStore.OwnerOf(0)
+	if err != nil {
+		t.Fatalf("OwnerOf existing shard returned error: %v", err)
+	}
+	if !found || existing.NodeID != 2 || existing.Epoch != 1 {
+		t.Fatalf("existing ownership changed: got %+v found=%v", existing, found)
+	}
+
+	for shardID := 1; shardID < 4; shardID++ {
+		expectedNodeID, err := rebalance.TargetNodeID([]int{1, 2}, shardID)
+		if err != nil {
+			t.Fatalf("TargetNodeID returned error: %v", err)
+		}
+		current, found, err := ownershipStore.OwnerOf(shardID)
+		if err != nil {
+			t.Fatalf("OwnerOf shard %d returned error: %v", shardID, err)
+		}
+		if !found || current.NodeID != expectedNodeID || current.Epoch != 1 {
+			t.Fatalf("ownership for shard %d = %+v found=%v, want node=%d epoch=1", shardID, current, found, expectedNodeID)
+		}
+	}
+}
+
+func TestEnsureInitialOwnershipRejectsInvalidShardCount(t *testing.T) {
+	err := EnsureInitialOwnership(nil, nil, 0)
+	if err == nil {
+		t.Fatal("expected EnsureInitialOwnership to reject invalid shard count")
+	}
+}
+
 func TestSweepKeepsOwnershipAfterLeaderSwitch(t *testing.T) {
 	client := startControllerEtcd(t)
 	prefix := "/test-controller-leader-switch"
@@ -60,7 +114,7 @@ func TestSweepKeepsOwnershipAfterLeaderSwitch(t *testing.T) {
 		t.Fatalf("NewEtcdElection returned error: %v", err)
 	}
 
-	sweepWithMetrics(context.Background(), ownershipStore, membershipStore, failoverController, nil, firstElection, 6, "", nil, nil, nil)
+	sweep(context.Background(), ownershipStore, membershipStore, failoverController, nil, firstElection, 6, "", nil, nil, nil)
 	before := mustListOwnerships(t, ownershipStore)
 	if len(before) != 6 {
 		t.Fatalf("ownership count mismatch: got %d, want 6", len(before))
@@ -70,7 +124,7 @@ func TestSweepKeepsOwnershipAfterLeaderSwitch(t *testing.T) {
 		t.Fatalf("Resign returned error: %v", err)
 	}
 
-	sweepWithMetrics(context.Background(), ownershipStore, membershipStore, failoverController, nil, secondElection, 6, "", nil, nil, nil)
+	sweep(context.Background(), ownershipStore, membershipStore, failoverController, nil, secondElection, 6, "", nil, nil, nil)
 	after := mustListOwnerships(t, ownershipStore)
 	if !reflect.DeepEqual(after, before) {
 		t.Fatalf("ownership changed after leader switch:\nbefore=%+v\nafter=%+v", before, after)
@@ -92,14 +146,14 @@ func TestSweepRecoversAfterEtcdTemporarilyUnavailable(t *testing.T) {
 	if err := membershipStore.MarkAlive(1); err != nil {
 		t.Fatalf("MarkAlive returned error: %v", err)
 	}
-	sweepWithMetrics(context.Background(), ownershipStore, membershipStore, failoverController, nil, leaderElection, 4, "", nil, nil, nil)
+	sweep(context.Background(), ownershipStore, membershipStore, failoverController, nil, leaderElection, 4, "", nil, nil, nil)
 	before := mustListOwnerships(t, ownershipStore)
 	if len(before) != 4 {
 		t.Fatalf("ownership count mismatch: got %d, want 4", len(before))
 	}
 
 	etcd.stop()
-	sweepWithMetrics(context.Background(), ownershipStore, membershipStore, failoverController, nil, leaderElection, 4, "", nil, nil, nil)
+	sweep(context.Background(), ownershipStore, membershipStore, failoverController, nil, leaderElection, 4, "", nil, nil, nil)
 
 	client.Close()
 	time.Sleep(1200 * time.Millisecond)
@@ -117,7 +171,7 @@ func TestSweepRecoversAfterEtcdTemporarilyUnavailable(t *testing.T) {
 		t.Fatalf("MarkAlive after restart returned error: %v", err)
 	}
 
-	sweepWithMetrics(context.Background(), recoveredOwnershipStore, recoveredMembershipStore, recoveredFailoverController, nil, recoveredElection, 4, "", nil, nil, nil)
+	sweep(context.Background(), recoveredOwnershipStore, recoveredMembershipStore, recoveredFailoverController, nil, recoveredElection, 4, "", nil, nil, nil)
 	after := mustListOwnerships(t, recoveredOwnershipStore)
 	if !reflect.DeepEqual(after, before) {
 		t.Fatalf("ownership changed after etcd recovery:\nbefore=%+v\nafter=%+v", before, after)
@@ -159,7 +213,7 @@ func TestSweepRecordsMetrics(t *testing.T) {
 		t.Fatalf("NewEtcdElection returned error: %v", err)
 	}
 
-	sweepWithMetrics(
+	sweep(
 		context.Background(),
 		ownershipStore,
 		membershipStore,

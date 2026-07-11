@@ -8,7 +8,6 @@ import (
 	"strings"
 	clusterelection "testP/internal/cluster/election"
 	"testP/internal/cluster/failover"
-	clusterlayout "testP/internal/cluster/layout"
 	"testP/internal/cluster/membership"
 	"testP/internal/cluster/ownership"
 	"testP/internal/cluster/rebalance"
@@ -31,11 +30,15 @@ type Config struct {
 	ErrorOutput   io.Writer
 }
 
+// controller能够执行的必需项
 type stores struct {
-	ownership  ownership.OwnershipStore
+	//控制权调度
+	ownership ownership.OwnershipStore
+	//存活检测
 	membership membership.MembershipStore
-	election   *clusterelection.EtcdElection
-	close      func() error
+	//自身保活机制
+	election *clusterelection.EtcdElection
+	close    func() error
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -46,7 +49,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("create controller stores: %w", err)
 	}
 	defer stores.close()
-
+	//启动子controller以及指标记录
 	failoverController := failover.NewFailoverController(stores.ownership, stores.membership)
 	rebalanceController := rebalance.NewController(stores.ownership, stores.membership)
 	metricsRecorder := startMetrics(ctx, cfg)
@@ -56,12 +59,13 @@ func Run(ctx context.Context, cfg Config) error {
 
 	printStartup(cfg)
 
+	//定时扫描，检测是否有不可用node，有就进行分片的迁移
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			sweepWithMetrics(
+			sweep(
 				ctx,
 				stores.ownership,
 				stores.membership,
@@ -103,6 +107,7 @@ func withDefaults(cfg Config) Config {
 	return cfg
 }
 
+// 组装store
 func newStores(endpointsText string, prefix string, controllerID string, membershipTTL time.Duration, electionTTL time.Duration) (stores, error) {
 	endpoints, err := ParseEtcdEndpoints(endpointsText)
 	if err != nil {
@@ -176,19 +181,7 @@ func printStartup(cfg Config) {
 	writeLine(cfg.Output, "shards: %d\n", cfg.ShardCount)
 }
 
-func Sweep(
-	ctx context.Context,
-	ownershipStore ownership.OwnershipStore,
-	membershipStore membership.MembershipStore,
-	failoverController *failover.FailoverController,
-	leaderElection *clusterelection.EtcdElection,
-	shardCount int,
-) {
-	rebalanceController := rebalance.NewController(ownershipStore, membershipStore)
-	sweepWithMetrics(ctx, ownershipStore, membershipStore, failoverController, rebalanceController, leaderElection, shardCount, "", nil, nil, nil)
-}
-
-func sweepWithMetrics(
+func sweep(
 	ctx context.Context,
 	ownershipStore ownership.OwnershipStore,
 	membershipStore membership.MembershipStore,
@@ -313,6 +306,10 @@ func recordClusterMetrics(
 }
 
 func EnsureInitialOwnership(ownershipStore ownership.OwnershipStore, membershipStore membership.MembershipStore, shardCount int) error {
+	if shardCount <= 0 {
+		return fmt.Errorf("shard count must be > 0")
+	}
+
 	lister, ok := ownershipStore.(ownership.OwnershipLister)
 	if !ok {
 		return fmt.Errorf("ownership store cannot list all ownerships")
@@ -322,10 +319,6 @@ func EnsureInitialOwnership(ownershipStore ownership.OwnershipStore, membershipS
 	if err != nil {
 		return err
 	}
-	if len(currentOwnerships) > 0 {
-		return nil
-	}
-
 	aliveNodes, err := membershipStore.AliveNodes()
 	if err != nil {
 		return err
@@ -334,14 +327,19 @@ func EnsureInitialOwnership(ownershipStore ownership.OwnershipStore, membershipS
 		return nil
 	}
 
-	layout, err := clusterlayout.NewModuloLayout(aliveNodes, shardCount)
-	if err != nil {
-		return err
+	ownedShardIDs := make(map[int]bool, len(currentOwnerships))
+	for _, currentOwnership := range currentOwnerships {
+		ownedShardIDs[currentOwnership.ShardID] = true
 	}
-	for _, shardID := range layout.ShardIDs() {
-		nodeID, ok := layout.OwnerOf(shardID)
-		if !ok {
-			return fmt.Errorf("owner for shard %d not found", shardID)
+
+	for shardID := 0; shardID < shardCount; shardID++ {
+		if ownedShardIDs[shardID] {
+			continue
+		}
+		//现在直接进行一致性哈希的分配了
+		nodeID, err := rebalance.TargetNodeID(aliveNodes, shardID)
+		if err != nil {
+			return err
 		}
 		if err := ownershipStore.Assign(shardID, nodeID); err != nil {
 			return err

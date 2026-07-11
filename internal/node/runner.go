@@ -27,18 +27,26 @@ type ownershipReader interface {
 }
 
 type Node struct {
-	mu              sync.Mutex
-	nodeID          int
-	eventlog        eventlog.Tailer
-	applier         eventApplier
-	store           checkpoint.ShardStore
-	nextStep        map[int]int64
-	active          map[int]*shardWorker
-	provider        clusterownership.ShardProvider
+	mu     sync.Mutex
+	nodeID int
+	//读取日志
+	eventlog eventlog.Tailer
+	//转义并执行事件
+	applier eventApplier
+	//持久化接口
+	store checkpoint.ShardStore
+	//持久化记录offset 意思是下一步要保存什么offset
+	nextStep map[int]int64
+	//目前自己仍持有的shard附带了一定的取消权，注意这是会过期的，要清理
+	active map[int]*shardWorker
+	//用来一键导出自己所有权下的shards
+	provider clusterownership.ShardProvider
+	//指标
 	metricsRecorder metrics.Recorder
 	refreshInterval time.Duration
-	onShardStart    func(shardID int) error
-	onShardStop     func(shardID int)
+	//hook
+	onShardStart func(shardID int) error
+	onShardStop  func(shardID int)
 }
 
 type shardWorker struct {
@@ -66,21 +74,6 @@ func NewRunner(ID int,
 		active:          make(map[int]*shardWorker),
 		refreshInterval: time.Second,
 	}
-}
-
-func (n *Node) SetRefreshInterval(interval time.Duration) {
-	if interval > 0 {
-		n.refreshInterval = interval
-	}
-}
-
-func (n *Node) SetMetricsRecorder(recorder metrics.Recorder) {
-	n.metricsRecorder = recorder
-}
-
-func (n *Node) SetShardLifecycleHooks(onStart func(shardID int) error, onStop func(shardID int)) {
-	n.onShardStart = onStart
-	n.onShardStop = onStop
 }
 
 func (n *Node) Run(ctx context.Context) error {
@@ -186,7 +179,7 @@ func (n *Node) startShard(
 	n.mu.Lock()
 	n.nextStep[ownership.ShardID] = nextOffset
 	n.mu.Unlock()
-
+	//我服了怎么又把goroutine扔锁里了
 	eventCh, err := n.openRecordStream(shardCtx, eventlog.Position{
 		ShardID: ownership.ShardID,
 		Offset:  nextOffset,
@@ -212,7 +205,7 @@ func (n *Node) startShard(
 		//如果fence失败，说明节点落后了，删除shard退出等待controller重新分配
 		if errors.Is(err, clusterownership.ErrOwnershipFenceLost) {
 			n.recordFencingReject(ownership.ShardID)
-			if n.removeActiveShardIfEpochMatches(ownership.ShardID, ownership.Epoch) && n.onShardStop != nil {
+			if n.removeActiveShard(ownership.ShardID, ownership.Epoch) && n.onShardStop != nil {
 				n.onShardStop(ownership.ShardID)
 			}
 			return
@@ -240,7 +233,7 @@ func (n *Node) runDynamicShard(ctx context.Context, eventCh <-chan eventlog.Reco
 			}
 
 			//执行事件，fence检测现已整合进apply动作前后
-			if err := n.applyDynamicEvent(ctx, record.Event, ownership); err != nil {
+			if err := n.applyEvent(ctx, record.Event, ownership); err != nil {
 				n.recordEventApplyError(record.Event)
 				return err
 			}
@@ -254,7 +247,7 @@ func (n *Node) runDynamicShard(ctx context.Context, eventCh <-chan eventlog.Reco
 	}
 }
 
-func (n *Node) applyDynamicEvent(ctx context.Context, event model.Event, ownership clusterownership.Ownership) error {
+func (n *Node) applyEvent(ctx context.Context, event model.Event, ownership clusterownership.Ownership) error {
 	if applier, ok := n.applier.(fencedEventApplier); ok {
 		return applier.ApplyWithFence(ctx, event, ownership)
 	}
@@ -266,27 +259,6 @@ func (n *Node) applyDynamicEvent(ctx context.Context, event model.Event, ownersh
 		return err
 	}
 	return n.checkShardFence(ownership.ShardID, ownership.Epoch)
-}
-
-func (n *Node) recordEventApply(event model.Event) {
-	if n.metricsRecorder == nil {
-		return
-	}
-	n.metricsRecorder.IncEventApply(n.nodeID, event.ShardID, string(event.Type))
-}
-
-func (n *Node) recordEventApplyError(event model.Event) {
-	if n.metricsRecorder == nil {
-		return
-	}
-	n.metricsRecorder.IncEventApplyError(n.nodeID, event.ShardID, string(event.Type))
-}
-
-func (n *Node) recordFencingReject(shardID int) {
-	if n.metricsRecorder == nil {
-		return
-	}
-	n.metricsRecorder.IncFencingReject(n.nodeID, shardID)
 }
 
 func (n *Node) checkShardFence(shardID int, epoch int64) error {
@@ -309,7 +281,7 @@ func (n *Node) checkShardFence(shardID int, epoch int64) error {
 
 	return nil
 }
-func (n *Node) removeActiveShardIfEpochMatches(shardID int, epoch int64) bool {
+func (n *Node) removeActiveShard(shardID int, epoch int64) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -387,4 +359,39 @@ func (n *Node) refreshOnce(ctx context.Context, errCh chan<- error) error {
 		}
 	}
 	return nil
+}
+func (n *Node) SetRefreshInterval(interval time.Duration) {
+	if interval > 0 {
+		n.refreshInterval = interval
+	}
+}
+
+func (n *Node) SetMetricsRecorder(recorder metrics.Recorder) {
+	n.metricsRecorder = recorder
+}
+
+func (n *Node) SetShardLifecycleHooks(onStart func(shardID int) error, onStop func(shardID int)) {
+	n.onShardStart = onStart
+	n.onShardStop = onStop
+}
+
+func (n *Node) recordEventApply(event model.Event) {
+	if n.metricsRecorder == nil {
+		return
+	}
+	n.metricsRecorder.IncEventApply(n.nodeID, event.ShardID, string(event.Type))
+}
+
+func (n *Node) recordEventApplyError(event model.Event) {
+	if n.metricsRecorder == nil {
+		return
+	}
+	n.metricsRecorder.IncEventApplyError(n.nodeID, event.ShardID, string(event.Type))
+}
+
+func (n *Node) recordFencingReject(shardID int) {
+	if n.metricsRecorder == nil {
+		return
+	}
+	n.metricsRecorder.IncFencingReject(n.nodeID, shardID)
 }
