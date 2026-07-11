@@ -6,6 +6,27 @@ import (
 	"testing"
 )
 
+func TestTargetNodeIDReturnsStableOwner(t *testing.T) {
+	first, err := TargetNodeID([]int{1, 2, 3}, 42)
+	if err != nil {
+		t.Fatalf("TargetNodeID returned error: %v", err)
+	}
+	second, err := TargetNodeID([]int{3, 1, 2}, 42)
+	if err != nil {
+		t.Fatalf("TargetNodeID returned error: %v", err)
+	}
+
+	if first != second {
+		t.Fatalf("target changed with node order: first=%d second=%d", first, second)
+	}
+}
+
+func TestTargetNodeIDRejectsEmptyNodes(t *testing.T) {
+	if _, err := TargetNodeID(nil, 1); err == nil {
+		t.Fatal("expected TargetNodeID to reject empty nodes")
+	}
+}
+
 func TestRebalanceOnceAppliesPlannerMove(t *testing.T) {
 	ownershipStore := newRebalanceTestOwnershipStore()
 	membershipStore := newRebalanceTestMembershipStore()
