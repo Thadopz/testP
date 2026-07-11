@@ -1,4 +1,22 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: testp-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: testp
+      POSTGRES_USER: testp
+      POSTGRES_PASSWORD: testp
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testp -d testp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d:ro
+
   etcd:
     image: quay.io/coreos/etcd:v3.6.1
     container_name: testp-etcd
@@ -78,6 +96,7 @@ services:
       - prometheus
 
 volumes:
+  postgres-data:
   etcd-data:
   kafka-data:
   prometheus-data:

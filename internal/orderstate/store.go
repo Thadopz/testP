@@ -9,6 +9,7 @@ const (
 	StatusSubmitted      Status = "submitted"
 	StatusCancelled      Status = "cancelled"
 	StatusRetryRequested Status = "retry_requested"
+	StatusMatchPending   Status = "match_pending"
 	StatusMatched        Status = "matched"
 	StatusMissed         Status = "missed"
 )
