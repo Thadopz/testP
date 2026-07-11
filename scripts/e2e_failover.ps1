@@ -228,7 +228,6 @@ try {
             "-etcd-prefix", $EtcdPrefix,
             "-kafka-brokers", $Brokers,
             "-kafka-topic", $Topic,
-            "-riders", "20",
             "-workers", "1"
         ) `
         -Name "node1" `
@@ -246,7 +245,6 @@ try {
             "-etcd-prefix", $EtcdPrefix,
             "-kafka-brokers", $Brokers,
             "-kafka-topic", $Topic,
-            "-riders", "20",
             "-workers", "1"
         ) `
         -Name "node2" `

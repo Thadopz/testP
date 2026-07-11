@@ -418,9 +418,7 @@ func runNodesUntilCaughtUp(
 				EventLog:        eventLog,
 				CheckpointStore: checkpointStore,
 				OrderStateStore: orderStateStore,
-				Riders:          scenario.Riders,
 				Workers:         cfg.Workers,
-				Seed:            cfg.Seed,
 				RefreshInterval: time.Hour,
 			})
 			resultCh <- nodeRunResult{result: result, err: err}

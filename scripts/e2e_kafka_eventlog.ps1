@@ -181,7 +181,6 @@ try {
             "-membership-ttl", "1500ms",
             "-kafka-brokers", $Brokers,
             "-kafka-topic", $Topic,
-            "-riders", "20",
             "-workers", "1"
         ) `
         -Name "node" `
