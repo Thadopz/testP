@@ -63,7 +63,7 @@ func NewPrometheusRecorder(registry *prometheus.Registry) *PrometheusRecorder {
 		nodeOnlineRiders: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: "testp",
 			Name:      "node_online_riders",
-			Help:      "Number of riders currently online in a node engine.",
+			Help:      "Number of riders currently visible to a node.",
 		}, []string{"node_id"}),
 		shardCheckpointOffset: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: "testp",

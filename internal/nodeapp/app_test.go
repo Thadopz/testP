@@ -9,7 +9,6 @@ import (
 	"testP/internal/eventlog"
 	"testP/internal/model"
 	"testP/internal/orderstate"
-	"testP/internal/shard"
 	"testing"
 	"time"
 )
@@ -32,9 +31,7 @@ func TestRunWithResultReplaysFileEventLogAndUsesCheckpoint(t *testing.T) {
 		ShardProvider:   ownershipStore,
 		DataDir:         dataDir,
 		CheckpointStore: checkpointStore,
-		Riders:          20,
 		Workers:         1,
-		Seed:            1,
 		RefreshInterval: time.Millisecond,
 	}
 
@@ -55,8 +52,8 @@ func TestRunWithResultReplaysFileEventLogAndUsesCheckpoint(t *testing.T) {
 		t.Fatalf("RunWithResult returned error: %v", err)
 	}
 	firstResult := <-firstResultCh
-	if firstResult.Submitted != 2 {
-		t.Fatalf("first submitted count mismatch: got %d, want %d", firstResult.Submitted, int64(2))
+	if firstResult.Submitted != 0 {
+		t.Fatalf("first submitted count mismatch: got %d, want 0", firstResult.Submitted)
 	}
 	assertShardMetric(t, firstResult.ShardMetrics, 1, 1, 2, 2, 0)
 
@@ -68,8 +65,8 @@ func TestRunWithResultReplaysFileEventLogAndUsesCheckpoint(t *testing.T) {
 	if !found {
 		t.Fatal("expected order state to be found")
 	}
-	if state.Status != orderstate.StatusSubmitted {
-		t.Fatalf("order status mismatch: got %q, want %q", state.Status, orderstate.StatusSubmitted)
+	if state.Status != orderstate.StatusCreated {
+		t.Fatalf("order status mismatch: got %q, want %q", state.Status, orderstate.StatusCreated)
 	}
 
 	loaded, found, err := checkpointStore.LoadShardCheckpoint(context.Background(), 1)
@@ -102,8 +99,8 @@ func TestRunWithResultReplaysFileEventLogAndUsesCheckpoint(t *testing.T) {
 		t.Fatalf("RunWithResult returned error: %v", err)
 	}
 	secondResult := <-secondResultCh
-	if secondResult.Submitted != 1 {
-		t.Fatalf("second submitted count mismatch: got %d, want %d", secondResult.Submitted, int64(1))
+	if secondResult.Submitted != 0 {
+		t.Fatalf("second submitted count mismatch: got %d, want 0", secondResult.Submitted)
 	}
 	assertShardMetric(t, secondResult.ShardMetrics, 1, 1, 3, 3, 0)
 }
@@ -130,9 +127,7 @@ func TestRunWithResultTailProcessesEventAppendedAfterStart(t *testing.T) {
 			ShardProvider:   ownershipStore,
 			DataDir:         dataDir,
 			CheckpointStore: checkpointStore,
-			Riders:          20,
 			Workers:         1,
-			Seed:            1,
 			RefreshInterval: time.Millisecond,
 		})
 		resultCh <- result
@@ -149,8 +144,8 @@ func TestRunWithResultTailProcessesEventAppendedAfterStart(t *testing.T) {
 	}
 
 	result := <-resultCh
-	if result.Submitted != 1 {
-		t.Fatalf("submitted count mismatch: got %d, want %d", result.Submitted, int64(1))
+	if result.Submitted != 0 {
+		t.Fatalf("submitted count mismatch: got %d, want 0", result.Submitted)
 	}
 	assertShardMetric(t, result.ShardMetrics, 1, 1, 1, 1, 0)
 }
@@ -185,9 +180,7 @@ func TestRunWithResultUsesInjectedShardCheckpointStore(t *testing.T) {
 			ShardProvider:   ownershipStore,
 			DataDir:         dataDir,
 			CheckpointStore: checkpointStore,
-			Riders:          20,
 			Workers:         1,
-			Seed:            1,
 			RefreshInterval: time.Millisecond,
 		})
 		resultCh <- result
@@ -203,8 +196,8 @@ func TestRunWithResultUsesInjectedShardCheckpointStore(t *testing.T) {
 	}
 
 	result := <-resultCh
-	if result.Submitted != 1 {
-		t.Fatalf("submitted count mismatch: got %d, want 1", result.Submitted)
+	if result.Submitted != 0 {
+		t.Fatalf("submitted count mismatch: got %d, want 0", result.Submitted)
 	}
 	assertShardMetric(t, result.ShardMetrics, 1, 1, 2, 2, 0)
 }
@@ -229,9 +222,7 @@ func TestRunWithResultReportsMetricsWhileRunning(t *testing.T) {
 			ShardProvider:   ownershipStore,
 			DataDir:         dataDir,
 			CheckpointStore: checkpointStore,
-			Riders:          20,
 			Workers:         1,
-			Seed:            1,
 			RefreshInterval: time.Millisecond,
 			MetricsInterval: time.Millisecond,
 			MetricsRecorder: metricsRecorder,
@@ -266,57 +257,6 @@ func TestRunWithResultReportsMetricsWhileRunning(t *testing.T) {
 	}
 }
 
-func TestRunWithResultTailConsumesMatchResultEvent(t *testing.T) {
-	dataDir := t.TempDir()
-	codec := &eventlog.JSONEventCodec{}
-	fileEventLog := eventlog.NewFileEventLog(dataDir+"/events", codec)
-	orderStore := orderstate.NewFileStore(dataDir + "/orders")
-	checkpointStore := checkpoint.NewMemoryStore()
-	riderCount := 1
-	cellSize := autoCellSize(defaultAreaSize, riderCount)
-	layout := shard.NewLayout(defaultAreaSize, cellSize, defaultShardCount)
-	shardID := layout.ShardID(10, 20)
-	ownershipStore := newNodeappTestOwnershipStore()
-	if err := ownershipStore.Assign(shardID, 10); err != nil {
-		t.Fatalf("Assign returned error: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	resultCh := make(chan Result, 1)
-	errCh := make(chan error, 1)
-
-	go func() {
-		result, err := RunWithResult(ctx, Config{
-			NodeID:          10,
-			ShardProvider:   ownershipStore,
-			DataDir:         dataDir,
-			CheckpointStore: checkpointStore,
-			Riders:          riderCount,
-			Workers:         1,
-			Seed:            1,
-			RefreshInterval: time.Millisecond,
-		})
-		resultCh <- result
-		errCh <- err
-	}()
-
-	appendOrderCreatedEventWithXY(t, fileEventLog, codec, "event-1", shardID, 1, 10, 20)
-	waitForOrderFinalStatus(t, orderStore, 1)
-	cancel()
-
-	err := <-errCh
-	if err != nil {
-		t.Fatalf("RunWithResult returned error: %v", err)
-	}
-
-	result := <-resultCh
-	if result.Matched+result.Missed != 1 {
-		t.Fatalf("result count mismatch: matched=%d missed=%d, want total 1", result.Matched, result.Missed)
-	}
-}
-
 func TestRunWithResultUsesInjectedOrderStateStore(t *testing.T) {
 	dataDir := t.TempDir()
 	codec := &eventlog.JSONEventCodec{}
@@ -339,16 +279,14 @@ func TestRunWithResultUsesInjectedOrderStateStore(t *testing.T) {
 			DataDir:         dataDir,
 			CheckpointStore: checkpointStore,
 			OrderStateStore: orderStore,
-			Riders:          20,
 			Workers:         1,
-			Seed:            1,
 			RefreshInterval: time.Millisecond,
 		})
 		errCh <- err
 	}()
 
 	appendOrderCreatedEvent(t, fileEventLog, codec, "event-1", 1, 1)
-	waitForOrderStateStatus(t, orderStore, 1, orderstate.StatusSubmitted)
+	waitForOrderStateStatus(t, orderStore, 1, orderstate.StatusCreated)
 	cancel()
 
 	if err := <-errCh; err != nil {
@@ -375,9 +313,7 @@ func TestRunWithResultDynamicProviderProcessesShardAssignedAfterStart(t *testing
 			ShardProvider:   ownershipStore,
 			DataDir:         dataDir,
 			CheckpointStore: checkpointStore,
-			Riders:          20,
 			Workers:         1,
-			Seed:            1,
 			RefreshInterval: time.Millisecond,
 		})
 		resultCh <- result
@@ -397,8 +333,8 @@ func TestRunWithResultDynamicProviderProcessesShardAssignedAfterStart(t *testing
 	}
 
 	result := <-resultCh
-	if result.Submitted != 1 {
-		t.Fatalf("submitted count mismatch: got %d, want %d", result.Submitted, int64(1))
+	if result.Submitted != 0 {
+		t.Fatalf("submitted count mismatch: got %d, want 0", result.Submitted)
 	}
 	if len(result.ShardIDs) != 1 || result.ShardIDs[0] != 1 {
 		t.Fatalf("result shard ids mismatch: got %v, want [1]", result.ShardIDs)
@@ -411,38 +347,10 @@ func TestRunWithResultRequiresShardProvider(t *testing.T) {
 		NodeID:          10,
 		DataDir:         t.TempDir(),
 		CheckpointStore: checkpoint.NewMemoryStore(),
-		Riders:          20,
 		Workers:         1,
-		Seed:            1,
 	})
 	if err == nil {
 		t.Fatal("expected RunWithResult to return an error")
-	}
-}
-
-func TestGenerateRidersForShardPartitionsRidersWithoutDuplicates(t *testing.T) {
-	const riderCount = 100
-	const seed = int64(7)
-	layout := shard.NewLayout(defaultAreaSize, autoCellSize(defaultAreaSize, riderCount), defaultShardCount)
-
-	seen := make(map[int64]int)
-	for shardID := 0; shardID < defaultShardCount; shardID++ {
-		riders := generateRidersForShard(seed, riderCount, defaultAreaSize, layout, shardID)
-		for _, rider := range riders {
-			if got := layout.ShardID(rider.X, rider.Y); got != shardID {
-				t.Fatalf("rider %d belongs to shard %d, returned for shard %d", rider.UID, got, shardID)
-			}
-			seen[rider.UID]++
-		}
-	}
-
-	if len(seen) != riderCount {
-		t.Fatalf("unique rider count = %d, want %d", len(seen), riderCount)
-	}
-	for riderID, occurrences := range seen {
-		if occurrences != 1 {
-			t.Fatalf("rider %d appears %d times, want 1", riderID, occurrences)
-		}
 	}
 }
 

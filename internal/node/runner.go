@@ -22,6 +22,10 @@ type fencedEventApplier interface {
 	ApplyWithFence(ctx context.Context, event model.Event, ownership clusterownership.Ownership) error
 }
 
+type transactionalRecordApplier interface {
+	ApplyRecordWithFence(ctx context.Context, record eventlog.Record, ownership clusterownership.Ownership) error
+}
+
 type ownershipReader interface {
 	OwnerOf(shardID int) (clusterownership.Ownership, bool, error)
 }
@@ -232,19 +236,39 @@ func (n *Node) runDynamicShard(ctx context.Context, eventCh <-chan eventlog.Reco
 				return fmt.Errorf("applier not found")
 			}
 
-			//执行事件，fence检测现已整合进apply动作前后
-			if err := n.applyEvent(ctx, record.Event, ownership); err != nil {
+			checkpointHandled, err := n.applyRecord(ctx, record, ownership)
+			if err != nil {
 				n.recordEventApplyError(record.Event)
 				return err
 			}
 			n.recordEventApply(record.Event)
 
-			//持久化
+			if checkpointHandled {
+				n.rememberCheckpoint(record.Position)
+				continue
+			}
 			if err := n.advanceCheckpoint(ctx, record.Position, ownership); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+func (n *Node) applyRecord(
+	ctx context.Context,
+	record eventlog.Record,
+	ownership clusterownership.Ownership,
+) (bool, error) {
+	if applier, ok := n.applier.(transactionalRecordApplier); ok {
+		return true, applier.ApplyRecordWithFence(ctx, record, ownership)
+	}
+	return false, n.applyEvent(ctx, record.Event, ownership)
+}
+
+func (n *Node) rememberCheckpoint(position eventlog.Position) {
+	n.mu.Lock()
+	n.nextStep[position.ShardID] = position.Offset + 1
+	n.mu.Unlock()
 }
 
 func (n *Node) applyEvent(ctx context.Context, event model.Event, ownership clusterownership.Ownership) error {

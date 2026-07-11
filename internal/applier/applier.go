@@ -3,8 +3,8 @@ package applier
 import (
 	"context"
 	"fmt"
+
 	"testP/internal/cluster/ownership"
-	"testP/internal/engine"
 	"testP/internal/eventlog"
 	"testP/internal/model"
 	"testP/internal/orderstate"
@@ -15,39 +15,29 @@ type OwnershipReader interface {
 }
 
 type EventApplier struct {
-	//解码编码事件
-	codec eventlog.EventCodec
-	//执行层
-	engine engine.Engine
-	//持有这个applier的node，用来认主
-	nodeID int
-	//拆出小接口用来测试
+	codec           eventlog.EventCodec
+	nodeID          int
 	ownershipReader OwnershipReader
-	//有限的幂等实现
-	orderStore orderstate.Store
+	orderStore      orderstate.Store
 }
 
-func NewEventApplier(codec eventlog.EventCodec, engine engine.Engine) *EventApplier {
-	return &EventApplier{
-		codec:  codec,
-		engine: engine,
-	}
+func NewEventApplier(codec eventlog.EventCodec) *EventApplier {
+	return &EventApplier{codec: codec}
 }
 
-func NewEventApplierWithOrderStore(codec eventlog.EventCodec, engine engine.Engine, orderStore orderstate.Store) *EventApplier {
-	applier := NewEventApplier(codec, engine)
+func NewEventApplierWithOrderStore(codec eventlog.EventCodec, orderStore orderstate.Store) *EventApplier {
+	applier := NewEventApplier(codec)
 	applier.orderStore = orderStore
 	return applier
 }
 
 func NewFencedEventApplier(
 	codec eventlog.EventCodec,
-	engine engine.Engine,
 	nodeID int,
 	reader OwnershipReader,
 	orderStore orderstate.Store,
 ) *EventApplier {
-	applier := NewEventApplier(codec, engine)
+	applier := NewEventApplier(codec)
 	applier.nodeID = nodeID
 	applier.ownershipReader = reader
 	applier.orderStore = orderStore
@@ -66,12 +56,6 @@ func (a *EventApplier) Apply(ctx context.Context, event model.Event) error {
 		return a.applyOrderMatched(ctx, event)
 	case model.EventOrderMissed:
 		return a.applyOrderMissed(ctx, event)
-	case model.EventRiderOnline:
-		return a.riderEventFunc(event)
-	case model.EventRiderMoved:
-		return a.riderEventFunc(event)
-	case model.EventRiderOffline:
-		return a.riderEventFunc(event)
 	default:
 		return fmt.Errorf("unsupported event type: %s", event.Type)
 	}
@@ -119,49 +103,25 @@ func (a *EventApplier) applyOrderCreated(ctx context.Context, event model.Event)
 	if err := a.codec.DecodePayload(event.Payload, &payload); err != nil {
 		return err
 	}
+
 	state, found, err := a.prepareOrderState(ctx, event, payload.OrderID)
 	if err != nil {
 		return err
 	}
-
-	if found {
-		if orderAlreadySubmitted(state.Status) {
-			return nil
-		}
-		if state.X == 0 && state.Y == 0 {
-			state.X = payload.X
-			state.Y = payload.Y
-		}
-	} else {
-		state.Status = orderstate.StatusCreated
-		state.X = payload.X
-		state.Y = payload.Y
-		if a.orderStore != nil {
-			if err := a.orderStore.Save(ctx, state); err != nil {
-				return err
-			}
-		}
-	}
-	//还是没有把batch换成真正的批处理，还在构思中，主要是批处理在这种情况下会存在大批订单积攒后集体失效的场景
-	//感觉比较复杂
-	if err := a.submitOrder(ctx, state.OrderID, state.X, state.Y); err != nil {
-		return err
+	if found && orderAlreadyQueuedOrFinished(state.Status) {
+		return nil
 	}
 
-	if a.orderStore != nil {
-		state.Status = orderstate.StatusSubmitted
-		return a.orderStore.Save(ctx, state)
-	}
-	return nil
+	state.Status = orderstate.StatusCreated
+	state.X = payload.X
+	state.Y = payload.Y
+	return a.saveOrderState(ctx, state)
 }
 
 func (a *EventApplier) applyOrderCancelled(ctx context.Context, event model.Event) error {
 	payload := model.OrderCancelled{}
 	if err := a.codec.DecodePayload(event.Payload, &payload); err != nil {
 		return err
-	}
-	if a.orderStore == nil {
-		return nil
 	}
 
 	state, _, err := a.prepareOrderState(ctx, event, payload.OrderID)
@@ -170,16 +130,13 @@ func (a *EventApplier) applyOrderCancelled(ctx context.Context, event model.Even
 	}
 	state.Status = orderstate.StatusCancelled
 	state.CancelReason = payload.Reason
-	return a.orderStore.Save(ctx, state)
+	return a.saveOrderState(ctx, state)
 }
 
 func (a *EventApplier) applyOrderRetryRequest(ctx context.Context, event model.Event) error {
 	payload := model.OrderRetryRequest{}
 	if err := a.codec.DecodePayload(event.Payload, &payload); err != nil {
 		return err
-	}
-	if a.orderStore == nil {
-		return nil
 	}
 
 	state, found, err := a.prepareOrderState(ctx, event, payload.OrderID)
@@ -196,25 +153,13 @@ func (a *EventApplier) applyOrderRetryRequest(ctx context.Context, event model.E
 	state.Status = orderstate.StatusRetryRequested
 	state.Attempt = payload.Attempt
 	state.RetryReason = payload.Reason
-	if err := a.orderStore.Save(ctx, state); err != nil {
-		return err
-	}
-
-	if err := a.submitOrder(ctx, state.OrderID, state.X, state.Y); err != nil {
-		return err
-	}
-
-	state.Status = orderstate.StatusSubmitted
-	return a.orderStore.Save(ctx, state)
+	return a.saveOrderState(ctx, state)
 }
 
 func (a *EventApplier) applyOrderMatched(ctx context.Context, event model.Event) error {
 	payload := model.OrderMatched{}
 	if err := a.codec.DecodePayload(event.Payload, &payload); err != nil {
 		return err
-	}
-	if a.orderStore == nil {
-		return nil
 	}
 
 	state, _, err := a.prepareOrderState(ctx, event, payload.OrderID)
@@ -224,16 +169,13 @@ func (a *EventApplier) applyOrderMatched(ctx context.Context, event model.Event)
 	state.Status = orderstate.StatusMatched
 	state.RiderID = payload.RiderID
 	state.Score = payload.Score
-	return a.orderStore.Save(ctx, state)
+	return a.saveOrderState(ctx, state)
 }
 
 func (a *EventApplier) applyOrderMissed(ctx context.Context, event model.Event) error {
 	payload := model.OrderMissed{}
 	if err := a.codec.DecodePayload(event.Payload, &payload); err != nil {
 		return err
-	}
-	if a.orderStore == nil {
-		return nil
 	}
 
 	state, _, err := a.prepareOrderState(ctx, event, payload.OrderID)
@@ -246,10 +188,9 @@ func (a *EventApplier) applyOrderMissed(ctx context.Context, event model.Event) 
 
 	state.Status = orderstate.StatusMissed
 	state.MissReason = payload.Reason
-	return a.orderStore.Save(ctx, state)
+	return a.saveOrderState(ctx, state)
 }
 
-// 统一做orderstate初始化，算是还之前的结构债了
 func (a *EventApplier) prepareOrderState(
 	ctx context.Context,
 	event model.Event,
@@ -277,37 +218,17 @@ func (a *EventApplier) prepareOrderState(
 	return state, found, nil
 }
 
-func (a *EventApplier) submitOrder(ctx context.Context, orderID int64, x int, y int) error {
-	return a.engine.SubmitBatch(ctx, model.OrderBatch{
-		Orders: []model.Order{
-			{
-				ID: orderID,
-				X:  x,
-				Y:  y,
-			},
-		},
-	})
+func (a *EventApplier) saveOrderState(ctx context.Context, state orderstate.State) error {
+	if a.orderStore == nil {
+		return nil
+	}
+	return a.orderStore.Save(ctx, state)
 }
 
-func orderAlreadySubmitted(status orderstate.Status) bool {
+func orderAlreadyQueuedOrFinished(status orderstate.Status) bool {
 	return status == orderstate.StatusSubmitted ||
+		status == orderstate.StatusMatchPending ||
 		status == orderstate.StatusMatched ||
 		status == orderstate.StatusMissed ||
 		status == orderstate.StatusCancelled
-}
-
-func (a *EventApplier) riderEventFunc(event model.Event) error {
-	payload := model.RiderEvent{}
-	err := a.codec.DecodePayload(event.Payload, &payload)
-	if err != nil {
-		return err
-	}
-	riderEvent := model.RiderEvent{
-		Type: payload.Type,
-		UID:  payload.UID,
-		X:    payload.X,
-		Y:    payload.Y,
-	}
-	a.engine.ApplyRiderEvent(riderEvent)
-	return err
 }

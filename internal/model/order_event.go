@@ -27,3 +27,10 @@ type OrderRetryRequest struct {
 	Attempt int
 	Reason  string
 }
+
+type MatchRequested struct {
+	OrderID int64
+	X       int
+	Y       int
+	Attempt int
+}

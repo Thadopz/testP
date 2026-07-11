@@ -12,6 +12,7 @@ import (
 	"testP/internal/checkpoint"
 	clustermembership "testP/internal/cluster/membership"
 	clusterownership "testP/internal/cluster/ownership"
+	db "testP/internal/database"
 	"testP/internal/eventlog"
 	appmetrics "testP/internal/metrics"
 	"testP/internal/nodeapp"
@@ -26,17 +27,13 @@ const defaultShardCount = 64
 type nodeEtcdRuntime struct {
 	ownership  clusterownership.OwnershipStore
 	membership clustermembership.MembershipStore
-	checkpoint checkpoint.ShardStore
-	orderState orderstate.Store
 	close      func() error
 }
 
 func main() {
 	nodeID := flag.Int("node-id", 1, "node id")
 	dataDir := flag.String("data-dir", "./data", "data directory")
-	riderCount := flag.Int("riders", 100, "initial rider count")
 	workerCount := flag.Int("workers", 2, "worker count")
-	seed := flag.Int64("seed", 1, "random seed")
 	heartbeatInterval := flag.Duration("heartbeat-interval", time.Second, "heartbeat interval")
 	etcdEndpoints := flag.String("etcd-endpoints", "127.0.0.1:2379", "comma separated etcd endpoints")
 	etcdPrefix := flag.String("etcd-prefix", "/testp", "etcd key prefix")
@@ -45,6 +42,7 @@ func main() {
 	metricsAddr := flag.String("metrics-addr", ":9101", "Prometheus metrics listen address; set empty to disable")
 	kafkaBrokersText := flag.String("kafka-brokers", "127.0.0.1:9092", "comma-separated Kafka broker addresses")
 	kafkaTopic := flag.String("kafka-topic", "order-events", "Kafka topic for order events")
+	postgresURL := flag.String("postgres-url", "postgres://testp:testp@127.0.0.1:5432/testp?sslmode=disable", "PostgreSQL connection URL")
 	flag.Parse()
 
 	etcdRuntime, err := newNodeEtcdRuntime(*etcdEndpoints, *etcdPrefix, *membershipTTL)
@@ -56,6 +54,14 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	postgresPool, err := db.Open(ctx, *postgresURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "connect postgres: %v\n", err)
+		os.Exit(2)
+	}
+	defer postgresPool.Close()
+	queries := db.New(postgresPool)
 
 	var metricsRecorder appmetrics.Recorder
 	if strings.TrimSpace(*metricsAddr) != "" {
@@ -87,8 +93,9 @@ func main() {
 		ShardProvider:   etcdRuntime.ownership,
 		DataDir:         *dataDir,
 		EventLog:        activeEventLog,
-		CheckpointStore: etcdRuntime.checkpoint,
-		OrderStateStore: etcdRuntime.orderState,
+		CheckpointStore: checkpoint.NewPostgresStore(queries),
+		OrderStateStore: orderstate.NewPostgresStore(queries),
+		PostgresPool:    postgresPool,
 		MetricsInterval: *metricsInterval,
 		MetricsRecorder: metricsRecorder,
 		MetricsSink: func(result nodeapp.Result, err error) {
@@ -98,9 +105,7 @@ func main() {
 			}
 			printNodeMetrics(result)
 		},
-		Riders:  *riderCount,
 		Workers: *workerCount,
-		Seed:    *seed,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "node failed: %v\n", err)
@@ -169,8 +174,6 @@ func newNodeEtcdRuntime(endpointsText string, prefix string, ttl time.Duration) 
 	return nodeEtcdRuntime{
 		ownership:  clusterownership.NewEtcdOwnershipStore(client, prefix),
 		membership: clustermembership.NewEtcdMembershipStoreWithTTL(client, prefix, ttl),
-		checkpoint: checkpoint.NewEtcdStore(client, prefix),
-		orderState: orderstate.NewEtcdStore(client, prefix),
 		close:      client.Close,
 	}, nil
 }
