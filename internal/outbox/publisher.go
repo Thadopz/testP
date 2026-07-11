@@ -70,38 +70,103 @@ func (p *Publisher) PublishOnce(ctx context.Context) (int, error) {
 
 	published := 0
 	queries := db.New(p.pool)
-	for _, item := range events {
-		target := p.targets[item.Topic]
+	for topic, items := range groupByTopic(events) {
+		target := p.targets[topic]
 		if target == nil {
-			p.markFailed(ctx, queries, item.EventID, fmt.Errorf("outbox topic %q is not configured", item.Topic))
+			for _, item := range items {
+				p.markFailed(ctx, queries, item.EventID, fmt.Errorf("outbox topic %q is not configured", item.Topic))
+			}
 			continue
 		}
 
-		event := model.Event{
-			ID:            item.EventID,
-			Type:          model.EventType(item.EventType),
-			AggregateType: item.AggregateType,
-			AggregateID:   item.AggregateID,
-			ShardID:       int(item.ShardID),
-			OccurredAt:    item.OccurredAt,
-			Payload:       item.Payload,
-		}
-		if _, err := target.Append(ctx, event); err != nil {
-			p.markFailed(ctx, queries, item.EventID, err)
-			continue
-		}
-
-		err := queries.MarkOutboxEventPublished(ctx, db.MarkOutboxEventPublishedParams{
-			EventID:     item.EventID,
-			PublishedAt: pgtype.Int8{Int64: time.Now().Unix(), Valid: true},
-			ClaimedBy:   p.config.WorkerID,
-		})
+		publishedIDs, err := p.publishTopic(ctx, queries, target, items)
 		if err != nil {
-			return published, fmt.Errorf("mark outbox event published: %w", err)
+			return published, err
 		}
-		published++
+		if len(publishedIDs) == 0 {
+			continue
+		}
+		if err := p.markPublished(ctx, queries, publishedIDs); err != nil {
+			return published, err
+		}
+		published += len(publishedIDs)
 	}
 	return published, nil
+}
+
+func groupByTopic(events []db.OutboxEvent) map[string][]db.OutboxEvent {
+	groups := make(map[string][]db.OutboxEvent)
+	for _, event := range events {
+		groups[event.Topic] = append(groups[event.Topic], event)
+	}
+	return groups
+}
+
+func (p *Publisher) publishTopic(
+	ctx context.Context,
+	queries *db.Queries,
+	target eventlog.Appender,
+	items []db.OutboxEvent,
+) ([]string, error) {
+	modelEvents := make([]model.Event, 0, len(items))
+	for _, item := range items {
+		modelEvents = append(modelEvents, outboxEventToModel(item))
+	}
+
+	if batchTarget, ok := target.(eventlog.BatchAppender); ok {
+		if _, err := batchTarget.AppendBatch(ctx, modelEvents); err != nil {
+			for _, item := range items {
+				p.markFailed(ctx, queries, item.EventID, err)
+			}
+			return nil, nil
+		}
+		return outboxEventIDs(items), nil
+	}
+
+	publishedIDs := make([]string, 0, len(items))
+	for index, event := range modelEvents {
+		if _, err := target.Append(ctx, event); err != nil {
+			p.markFailed(ctx, queries, items[index].EventID, err)
+			continue
+		}
+		publishedIDs = append(publishedIDs, items[index].EventID)
+	}
+	return publishedIDs, nil
+}
+
+func outboxEventToModel(item db.OutboxEvent) model.Event {
+	return model.Event{
+		ID:            item.EventID,
+		Type:          model.EventType(item.EventType),
+		AggregateType: item.AggregateType,
+		AggregateID:   item.AggregateID,
+		ShardID:       int(item.ShardID),
+		OccurredAt:    item.OccurredAt,
+		Payload:       item.Payload,
+	}
+}
+
+func outboxEventIDs(items []db.OutboxEvent) []string {
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.EventID)
+	}
+	return ids
+}
+
+func (p *Publisher) markPublished(ctx context.Context, queries *db.Queries, eventIDs []string) error {
+	updated, err := queries.MarkOutboxEventsPublished(ctx, db.MarkOutboxEventsPublishedParams{
+		PublishedAt: pgtype.Int8{Int64: time.Now().Unix(), Valid: true},
+		EventIds:    eventIDs,
+		ClaimedBy:   p.config.WorkerID,
+	})
+	if err != nil {
+		return fmt.Errorf("mark outbox events published: %w", err)
+	}
+	if updated != int64(len(eventIDs)) {
+		return fmt.Errorf("marked %d outbox events published, want %d", updated, len(eventIDs))
+	}
+	return nil
 }
 
 func (p *Publisher) claim(ctx context.Context) ([]db.OutboxEvent, error) {

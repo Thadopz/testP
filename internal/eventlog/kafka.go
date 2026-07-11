@@ -65,7 +65,7 @@ func NewKafkaEventLog(cfg KafkaConfig) (*KafkaEventLog, error) {
 			Addr:         kafka.TCP(cfg.Brokers...),
 			Topic:        cfg.Topic,
 			Balancer:     shardIDBalancer{},
-			BatchSize:    1,
+			BatchSize:    100,
 			BatchTimeout: 10 * time.Millisecond,
 			Transport: &kafka.Transport{
 				Dial: localKafkaDial,
@@ -75,32 +75,49 @@ func NewKafkaEventLog(cfg KafkaConfig) (*KafkaEventLog, error) {
 }
 
 func (l *KafkaEventLog) Append(ctx context.Context, event model.Event) (Position, error) {
-	if err := ctx.Err(); err != nil {
-		return Position{}, err
-	}
-	if event.ShardID < 0 {
-		return Position{}, fmt.Errorf("shard id must be >= 0: %d", event.ShardID)
-	}
-
-	msg, err := l.encodeMessage(event)
+	positions, err := l.AppendBatch(ctx, []model.Event{event})
 	if err != nil {
 		return Position{}, err
+	}
+	return positions[0], nil
+}
+
+func (l *KafkaEventLog) AppendBatch(ctx context.Context, events []model.Event) ([]Position, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(events) == 0 {
+		return nil, nil
+	}
+
+	messages := make([]kafka.Message, 0, len(events))
+	positions := make([]Position, 0, len(events))
+	for _, event := range events {
+		if event.ShardID < 0 {
+			return nil, fmt.Errorf("shard id must be >= 0: %d", event.ShardID)
+		}
+		msg, err := l.encodeMessage(event)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, msg)
+		positions = append(positions, Position{
+			ShardID: event.ShardID,
+			Offset:  -1,
+		})
 	}
 
 	l.closeMu.Lock()
 	writer := l.writer
 	l.closeMu.Unlock()
 	if writer == nil {
-		return Position{}, fmt.Errorf("kafka eventlog is closed")
+		return nil, fmt.Errorf("kafka eventlog is closed")
 	}
-	if err := writer.WriteMessages(ctx, msg); err != nil {
-		return Position{}, fmt.Errorf("write kafka message: %w", err)
+	if err := writer.WriteMessages(ctx, messages...); err != nil {
+		return nil, fmt.Errorf("write kafka messages: %w", err)
 	}
 
-	return Position{
-		ShardID: event.ShardID,
-		Offset:  -1,
-	}, nil
+	return positions, nil
 }
 
 func (l *KafkaEventLog) Close() error {

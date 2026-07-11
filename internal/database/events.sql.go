@@ -151,6 +151,30 @@ func (q *Queries) MarkOutboxEventPublished(ctx context.Context, arg MarkOutboxEv
 	return err
 }
 
+const markOutboxEventsPublished = `-- name: MarkOutboxEventsPublished :execrows
+UPDATE outbox_events
+SET published_at = $1,
+    claimed_by = '',
+    claimed_until = 0,
+    last_error = ''
+WHERE event_id = ANY($2::text[])
+  AND claimed_by = $3
+`
+
+type MarkOutboxEventsPublishedParams struct {
+	PublishedAt pgtype.Int8 `json:"published_at"`
+	EventIds    []string    `json:"event_ids"`
+	ClaimedBy   string      `json:"claimed_by"`
+}
+
+func (q *Queries) MarkOutboxEventsPublished(ctx context.Context, arg MarkOutboxEventsPublishedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markOutboxEventsPublished, arg.PublishedAt, arg.EventIds, arg.ClaimedBy)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const recordInboxEvent = `-- name: RecordInboxEvent :execrows
 INSERT INTO inbox_events (consumer_name, event_id, shard_id, offset_value, processed_at)
 VALUES ($1, $2, $3, $4, $5)

@@ -22,6 +22,10 @@ type Appender interface {
 	Append(ctx context.Context, event model.Event) (Position, error)
 }
 
+type BatchAppender interface {
+	AppendBatch(ctx context.Context, events []model.Event) ([]Position, error)
+}
+
 type Tailer interface {
 	TailFrom(ctx context.Context, position Position) (<-chan Record, error)
 }
@@ -59,26 +63,38 @@ func (m *MemoryEventLog) EndOffset(ctx context.Context, shardID int) (int64, err
 }
 
 func (m *MemoryEventLog) Append(ctx context.Context, event model.Event) (Position, error) {
+	positions, err := m.AppendBatch(ctx, []model.Event{event})
+	if err != nil {
+		return Position{}, err
+	}
+	return positions[0], nil
+}
+
+func (m *MemoryEventLog) AppendBatch(ctx context.Context, events []model.Event) ([]Position, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
-		return Position{}, err
+		return nil, err
 	}
 	if m.records == nil {
 		m.records = make(map[int][]Record)
 	}
-	position := Position{}
-	if _, ok := m.records[event.ShardID]; !ok {
-		return position, fmt.Errorf("Shard Not Found")
-	}
-	position = Position{event.ShardID, int64(len(m.records[event.ShardID]))}
-	m.records[event.ShardID] = append(m.records[event.ShardID], Record{
-		Position: position,
-		Event:    event,
-	})
 
-	return position, nil
+	positions := make([]Position, 0, len(events))
+	for _, event := range events {
+		if _, ok := m.records[event.ShardID]; !ok {
+			return nil, fmt.Errorf("Shard Not Found")
+		}
+		position := Position{event.ShardID, int64(len(m.records[event.ShardID]))}
+		m.records[event.ShardID] = append(m.records[event.ShardID], Record{
+			Position: position,
+			Event:    event,
+		})
+		positions = append(positions, position)
+	}
+
+	return positions, nil
 }
 
 func (m *MemoryEventLog) ReadFrom(ctx context.Context, position Position) (<-chan Record, error) {

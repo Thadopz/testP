@@ -17,6 +17,7 @@ import (
 func main() {
 	dataDir := flag.String("data-dir", "./data", "data directory")
 	orderCount := flag.Int("orders", 100, "number of order_created events to write")
+	batchSize := flag.Int("batch-size", 100, "number of events to write per Kafka batch")
 	seed := flag.Int64("seed", 1, "random seed")
 	startID := flag.Int64("start-id", 1, "first order id")
 	metricsAddr := flag.String("metrics-addr", ":9103", "Prometheus metrics listen address; set empty to disable")
@@ -46,12 +47,13 @@ func main() {
 	}
 
 	result, err := producerapp.Run(ctx, producerapp.Config{
-		DataDir:  *dataDir,
-		EventLog: activeEventLog,
-		Orders:   *orderCount,
-		Seed:     *seed,
-		StartID:  *startID,
-		Metrics:  metricsRecorder,
+		DataDir:   *dataDir,
+		EventLog:  activeEventLog,
+		Orders:    *orderCount,
+		BatchSize: *batchSize,
+		Seed:      *seed,
+		StartID:   *startID,
+		Metrics:   metricsRecorder,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "producer failed: %v\n", err)

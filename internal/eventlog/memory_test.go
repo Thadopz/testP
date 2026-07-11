@@ -29,6 +29,28 @@ func TestMemoryEventLogAppendAssignsIncreasingOffsets(t *testing.T) {
 	}
 }
 
+func TestMemoryEventLogAppendBatchAssignsOffsets(t *testing.T) {
+	eventLog := newTestMemoryEventLog(2)
+
+	positions, err := eventLog.AppendBatch(context.Background(), []model.Event{
+		testEvent("event-1", 2),
+		testEvent("event-2", 2),
+	})
+	if err != nil {
+		t.Fatalf("AppendBatch returned error: %v", err)
+	}
+
+	if len(positions) != 2 {
+		t.Fatalf("position count = %d, want 2", len(positions))
+	}
+	if positions[0] != (Position{ShardID: 2, Offset: 0}) {
+		t.Fatalf("first position mismatch: got %+v", positions[0])
+	}
+	if positions[1] != (Position{ShardID: 2, Offset: 1}) {
+		t.Fatalf("second position mismatch: got %+v", positions[1])
+	}
+}
+
 func TestMemoryEventLogReadFromReturnsRecordsFromOffset(t *testing.T) {
 	eventLog := newTestMemoryEventLog(3)
 

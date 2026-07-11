@@ -18,15 +18,16 @@ const (
 )
 
 type Config struct {
-	DataDir  string
-	EventLog eventlog.Appender
-	Orders   int
-	Seed     int64
-	StartID  int64
-	AreaSize int
-	CellSize int
-	Shards   int
-	Metrics  metrics.Recorder
+	DataDir   string
+	EventLog  eventlog.Appender
+	Orders    int
+	Seed      int64
+	StartID   int64
+	AreaSize  int
+	CellSize  int
+	Shards    int
+	BatchSize int
+	Metrics   metrics.Recorder
 }
 
 type Result struct {
@@ -47,6 +48,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	activeEventLog := cfg.EventLog
 	layout := shard.NewLayout(cfg.AreaSize, cfg.CellSize, cfg.Shards)
 	rng := rand.New(rand.NewSource(cfg.Seed))
+	batch := make([]model.Event, 0, cfg.BatchSize)
 
 	for index := 0; index < cfg.Orders; index++ {
 		if err := ctx.Err(); err != nil {
@@ -79,12 +81,22 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			Payload:       payload,
 		}
 
-		_, err = activeEventLog.Append(ctx, event)
-		if err != nil {
-			recordProducerError(cfg.Metrics, "append")
-			return Result{}, fmt.Errorf("append order event: %w", err)
+		batch = append(batch, event)
+		if len(batch) >= cfg.BatchSize {
+			if err := appendOrderEvents(ctx, activeEventLog, batch); err != nil {
+				recordProducerError(cfg.Metrics, "append")
+				return Result{}, err
+			}
+			recordProducerEvents(cfg.Metrics, batch)
+			batch = batch[:0]
 		}
-		recordProducerEvent(cfg.Metrics, event)
+	}
+	if len(batch) > 0 {
+		if err := appendOrderEvents(ctx, activeEventLog, batch); err != nil {
+			recordProducerError(cfg.Metrics, "append")
+			return Result{}, err
+		}
+		recordProducerEvents(cfg.Metrics, batch)
 	}
 
 	result := Result{
@@ -98,6 +110,28 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 
 	return result, nil
+}
+
+func appendOrderEvents(ctx context.Context, appender eventlog.Appender, events []model.Event) error {
+	if batchAppender, ok := appender.(eventlog.BatchAppender); ok {
+		if _, err := batchAppender.AppendBatch(ctx, events); err != nil {
+			return fmt.Errorf("append order event batch: %w", err)
+		}
+		return nil
+	}
+
+	for _, event := range events {
+		if _, err := appender.Append(ctx, event); err != nil {
+			return fmt.Errorf("append order event: %w", err)
+		}
+	}
+	return nil
+}
+
+func recordProducerEvents(recorder metrics.Recorder, events []model.Event) {
+	for _, event := range events {
+		recordProducerEvent(recorder, event)
+	}
 }
 
 func recordProducerEvent(recorder metrics.Recorder, event model.Event) {
@@ -132,6 +166,9 @@ func withDefaults(cfg Config) Config {
 	}
 	if cfg.Shards <= 0 {
 		cfg.Shards = defaultShardCount
+	}
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = 100
 	}
 	return cfg
 }

@@ -19,6 +19,7 @@ type Querier interface {
 	MarkOrderMissed(ctx context.Context, arg MarkOrderMissedParams) (int64, error)
 	MarkOutboxEventFailed(ctx context.Context, arg MarkOutboxEventFailedParams) error
 	MarkOutboxEventPublished(ctx context.Context, arg MarkOutboxEventPublishedParams) error
+	MarkOutboxEventsPublished(ctx context.Context, arg MarkOutboxEventsPublishedParams) (int64, error)
 	RecordInboxEvent(ctx context.Context, arg RecordInboxEventParams) (int64, error)
 	ReserveRider(ctx context.Context, arg ReserveRiderParams) (Rider, error)
 	UpsertOrder(ctx context.Context, arg UpsertOrderParams) error

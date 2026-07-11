@@ -103,6 +103,35 @@ func TestRunUsesInjectedEventLog(t *testing.T) {
 	}
 }
 
+func TestRunUsesBatchAppender(t *testing.T) {
+	eventLog := &recordingBatchEventLog{}
+
+	_, err := Run(context.Background(), Config{
+		DataDir:   t.TempDir(),
+		EventLog:  eventLog,
+		Orders:    5,
+		BatchSize: 2,
+		Seed:      1,
+		StartID:   10,
+		AreaSize:  1000,
+		CellSize:  100,
+		Shards:    4,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if eventLog.appendCalls != 0 {
+		t.Fatalf("append calls = %d, want 0", eventLog.appendCalls)
+	}
+	if eventLog.batchCalls != 3 {
+		t.Fatalf("batch calls = %d, want 3", eventLog.batchCalls)
+	}
+	if len(eventLog.events) != 5 {
+		t.Fatalf("event count = %d, want 5", len(eventLog.events))
+	}
+}
+
 type recordingEventLog struct {
 	events []model.Event
 }
@@ -114,6 +143,36 @@ func (l *recordingEventLog) Append(ctx context.Context, event model.Event) (even
 	}
 	l.events = append(l.events, event)
 	return position, nil
+}
+
+type recordingBatchEventLog struct {
+	events      []model.Event
+	appendCalls int
+	batchCalls  int
+}
+
+func (l *recordingBatchEventLog) Append(ctx context.Context, event model.Event) (eventlog.Position, error) {
+	l.appendCalls++
+	position := eventlog.Position{
+		ShardID: event.ShardID,
+		Offset:  int64(len(l.events)),
+	}
+	l.events = append(l.events, event)
+	return position, nil
+}
+
+func (l *recordingBatchEventLog) AppendBatch(ctx context.Context, events []model.Event) ([]eventlog.Position, error) {
+	l.batchCalls++
+	positions := make([]eventlog.Position, 0, len(events))
+	for _, event := range events {
+		position := eventlog.Position{
+			ShardID: event.ShardID,
+			Offset:  int64(len(l.events)),
+		}
+		l.events = append(l.events, event)
+		positions = append(positions, position)
+	}
+	return positions, nil
 }
 
 type producerTestMetricsRecorder struct {

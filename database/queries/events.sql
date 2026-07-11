@@ -35,6 +35,15 @@ SET published_at = $2,
 WHERE event_id = $1
   AND claimed_by = $3;
 
+-- name: MarkOutboxEventsPublished :execrows
+UPDATE outbox_events
+SET published_at = sqlc.arg(published_at),
+    claimed_by = '',
+    claimed_until = 0,
+    last_error = ''
+WHERE event_id = ANY(sqlc.arg(event_ids)::text[])
+  AND claimed_by = sqlc.arg(claimed_by);
+
 -- name: MarkOutboxEventFailed :exec
 UPDATE outbox_events
 SET claimed_by = '',
