@@ -1,6 +1,7 @@
 param(
     [int]$Partitions = 64,
-    [int]$ReplicationFactor = 1
+    [int]$ReplicationFactor = 1,
+    [int]$ReadyTimeoutSeconds = 60
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,5 +11,6 @@ foreach ($Topic in @("order-events", "rider-events", "match-requests")) {
     & "$ScriptRoot\kafka_create_topic.ps1" `
         -Topic $Topic `
         -Partitions $Partitions `
-        -ReplicationFactor $ReplicationFactor
+        -ReplicationFactor $ReplicationFactor `
+        -ReadyTimeoutSeconds $ReadyTimeoutSeconds
 }
