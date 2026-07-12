@@ -26,6 +26,10 @@ type transactionalRecordApplier interface {
 	ApplyRecordWithFence(ctx context.Context, record eventlog.Record, ownership clusterownership.Ownership) error
 }
 
+type transactionalBatchRecordApplier interface {
+	ApplyRecordsWithFence(ctx context.Context, records []eventlog.Record, ownership clusterownership.Ownership) error
+}
+
 type ownershipReader interface {
 	OwnerOf(shardID int) (clusterownership.Ownership, bool, error)
 }
@@ -48,6 +52,8 @@ type Node struct {
 	//指标
 	metricsRecorder metrics.Recorder
 	refreshInterval time.Duration
+	batchSize       int
+	batchWait       time.Duration
 	//hook
 	onShardStart func(shardID int) error
 	onShardStop  func(shardID int)
@@ -77,6 +83,8 @@ func NewRunner(ID int,
 		nextStep:        make(map[int]int64),
 		active:          make(map[int]*shardWorker),
 		refreshInterval: time.Second,
+		batchSize:       100,
+		batchWait:       10 * time.Millisecond,
 	}
 }
 
@@ -224,6 +232,13 @@ func (n *Node) startShard(
 }
 
 func (n *Node) runDynamicShard(ctx context.Context, eventCh <-chan eventlog.Record, ownership clusterownership.Ownership) error {
+	if _, ok := n.applier.(transactionalBatchRecordApplier); ok {
+		return n.runBatchedShard(ctx, eventCh, ownership)
+	}
+	return n.runSingleRecordShard(ctx, eventCh, ownership)
+}
+
+func (n *Node) runSingleRecordShard(ctx context.Context, eventCh <-chan eventlog.Record, ownership clusterownership.Ownership) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -251,6 +266,64 @@ func (n *Node) runDynamicShard(ctx context.Context, eventCh <-chan eventlog.Reco
 				return err
 			}
 		}
+	}
+}
+
+func (n *Node) runBatchedShard(ctx context.Context, eventCh <-chan eventlog.Record, ownership clusterownership.Ownership) error {
+	applier := n.applier.(transactionalBatchRecordApplier)
+	for {
+		records, open, err := collectRecordBatch(ctx, eventCh, n.batchSize, n.batchWait)
+		if err != nil {
+			return err
+		}
+		if !open {
+			return nil
+		}
+
+		if err := applier.ApplyRecordsWithFence(ctx, records, ownership); err != nil {
+			n.recordEventApplyError(records[0].Event)
+			return err
+		}
+		for _, record := range records {
+			n.recordEventApply(record.Event)
+		}
+		n.rememberCheckpoint(records[len(records)-1].Position)
+	}
+}
+
+func collectRecordBatch(
+	ctx context.Context,
+	eventCh <-chan eventlog.Record,
+	batchSize int,
+	batchWait time.Duration,
+) ([]eventlog.Record, bool, error) {
+	select {
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	case first, open := <-eventCh:
+		if !open {
+			return nil, false, nil
+		}
+
+		records := make([]eventlog.Record, 0, batchSize)
+		records = append(records, first)
+		timer := time.NewTimer(batchWait)
+		defer timer.Stop()
+
+		for len(records) < batchSize {
+			select {
+			case <-ctx.Done():
+				return nil, false, ctx.Err()
+			case record, open := <-eventCh:
+				if !open {
+					return records, true, nil
+				}
+				records = append(records, record)
+			case <-timer.C:
+				return records, true, nil
+			}
+		}
+		return records, true, nil
 	}
 }
 
@@ -387,6 +460,15 @@ func (n *Node) refreshOnce(ctx context.Context, errCh chan<- error) error {
 func (n *Node) SetRefreshInterval(interval time.Duration) {
 	if interval > 0 {
 		n.refreshInterval = interval
+	}
+}
+
+func (n *Node) SetBatchOptions(size int, wait time.Duration) {
+	if size > 0 {
+		n.batchSize = size
+	}
+	if wait > 0 {
+		n.batchWait = wait
 	}
 }
 

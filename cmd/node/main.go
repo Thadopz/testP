@@ -34,6 +34,8 @@ func main() {
 	nodeID := flag.Int("node-id", 1, "node id")
 	dataDir := flag.String("data-dir", "./data", "data directory")
 	workerCount := flag.Int("workers", 2, "worker count")
+	batchSize := flag.Int("batch-size", 100, "maximum order events per PostgreSQL transaction")
+	batchWait := flag.Duration("batch-wait", 10*time.Millisecond, "maximum wait for an order event batch")
 	heartbeatInterval := flag.Duration("heartbeat-interval", time.Second, "heartbeat interval")
 	etcdEndpoints := flag.String("etcd-endpoints", "127.0.0.1:2379", "comma separated etcd endpoints")
 	etcdPrefix := flag.String("etcd-prefix", "/testp", "etcd key prefix")
@@ -105,7 +107,9 @@ func main() {
 			}
 			printNodeMetrics(result)
 		},
-		Workers: *workerCount,
+		Workers:   *workerCount,
+		BatchSize: *batchSize,
+		BatchWait: *batchWait,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "node failed: %v\n", err)

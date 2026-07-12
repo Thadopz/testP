@@ -31,6 +31,8 @@ type Config struct {
 	MetricsRecorder metrics.Recorder
 	Workers         int
 	RefreshInterval time.Duration
+	BatchSize       int
+	BatchWait       time.Duration
 	PostgresPool    *pgxpool.Pool
 }
 
@@ -98,6 +100,7 @@ func RunWithResult(ctx context.Context, cfg Config) (Result, error) {
 
 	runner := node.NewRunner(cfg.NodeID, cfg.ShardProvider, activeEventLog, activeEventApplier, cfg.CheckpointStore)
 	runner.SetRefreshInterval(cfg.RefreshInterval)
+	runner.SetBatchOptions(cfg.BatchSize, cfg.BatchWait)
 	runner.SetMetricsRecorder(cfg.MetricsRecorder)
 
 	if cfg.MetricsSink != nil && cfg.MetricsInterval > 0 {
@@ -204,6 +207,12 @@ func withDefaults(cfg Config) Config {
 	}
 	if cfg.Workers <= 0 {
 		cfg.Workers = 2
+	}
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = 100
+	}
+	if cfg.BatchWait <= 0 {
+		cfg.BatchWait = 10 * time.Millisecond
 	}
 	return cfg
 }

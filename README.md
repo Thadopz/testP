@@ -55,7 +55,7 @@ flowchart LR
 1. 首先`cmd/producer` 生成 `order_created` 事件并批量写入 Kafka；测试时也可以由 `cmd/retry-producer` 为 `missed` 订单写入 `order_retry_request`。
 2. 控制器`cmd/controller` 竞选leader，读取etcd中用来观测节点存活状态的membership，并维护shard到node的所属权ownership。
 3. `cmd/node` 和 `cmd/matcher-worker` 使用同一个 logical `node-id` 定期写入心跳，读取自己持有的shard ownership。
-4. Order Worker在PostgreSQL事务中保存订单、Inbox、`match_requested` Outbox 和 checkpoint。
+4. Order Worker按 shard 收集连续事件，并在一个PostgreSQL事务中保存这一批订单、Inbox、`match_requested` Outbox 和批末 checkpoint。
 5. Outbox Publisher 将请求发布到 `match-requests`实现消息队列到数据库的稳定链接，Matcher Worker在内存索引筛选 TopK，基本保留原先单机模型算法，但是目前还在设计怎么高效访问其他节点骑手的算法，此功能在开发中实现过但是对性能影响过大被砍掉了。
 6. Matcher Worker在事务中预约骑手、更新订单并写入 `matched/missed` Outbox。
 7. 结果经 `order-events` 回到 Order Worker；ownership epoch 变化时旧worker被fencing拒绝。
@@ -65,14 +65,14 @@ flowchart LR
 - 使用Kafka作为订单事件日志。
 - 使用etcd保存节点存活状态membership、分片所属权shard ownership和控制器的leader选举controller election。
 - 使用PostgreSQL保存订单、骑手、分消费者 Inbox/Checkpoint 和定向 Outbox。
-- `cmd/node`和`cmd/matcher-worker`按当前ownership动态消费自己负责的 shard，目前还在优化批处理流程，基本能跑但是性能有待提升。
+- `cmd/node`和`cmd/matcher-worker`按当前ownership动态消费自己负责的 shard；Order Worker已经支持按 shard 微批事务，Matcher Worker仍按请求逐条匹配。
 - controller通过leader election保证同一时间只有一个active controller向etcd发起ownership维护。
 - logical node心跳失效后，controller会把dead node的shard迁移给存活节点。
 - ownership带epoch，Order Worker和Matcher Worker都会做fencing校验，避免旧owner在恢复后继续写入过期状态。
 - checkpoint在事件成功apply后推进，可能会有重放动作不过能保持最终一致性，因为：
   - PostgreSQL模式下，inbox、order state、outbox 和 checkpoint 在同一个本地事务中提交；重复的 event ID 不会再次修改订单状态。
   - `outbox` 匹配模式通过 `match-requests` topic 和独立 Matcher Worker 完成匹配，最终骑手占用由PostgreSQL条件更新裁决。
-- Producer支持批量写Kafka，Outbox Publisher支持批量领取、按 topic 批量发布和批量标记完成，初步完成一部分批处理，还有订单的批处理还在优化中。
+- Producer支持批量写Kafka，Outbox Publisher支持批量领取、按 topic 批量发布和批量标记完成，Order Worker支持将一批连续事件放进同一个数据库事务。
 - `retry-producer` 可以按订单范围和 attempt 为当前 `missed` 订单批量发送重试事件。
 - 暴露 Prometheus 指标，并提供 Grafana dashboard。
 
@@ -186,7 +186,7 @@ go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
 - [设计目标](docs/design.md#1-设计目标)
 - [核心对象与不变量](docs/design.md#2-核心对象与不变量)
 - [实现思路](docs/design.md#3-实现思路)
-
+- [过往的废案](docs/design.md#4-过往的废案)
 ## 观测
 
 Prometheus：
@@ -253,6 +253,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\e2e_outbox_matching.ps1
 -kafka-brokers        Kafka broker，默认 127.0.0.1:9092
 -kafka-topic          Kafka topic，默认 order-events
 -postgres-url         PostgreSQL 连接地址，默认使用本地 testp 数据库
+-batch-size           单个 shard 每次事务最多处理的事件数，默认 100
+-batch-wait           微批等待窗口，默认 10ms
 ```
 
 `cmd/matcher-worker` 消费 `match-requests`，主要参数为 `-node-id`、`-riders`、`-refresh-interval`、`-match-topic`、`-postgres-url`、`-candidate-limit` 和 `-max-rider-orders`。`cmd/outbox-publisher` 通过 `-worker-id`、`-batch-size`、`-poll-interval`、`-order-topic` 和 `-match-topic` 控制 Outbox 发布。

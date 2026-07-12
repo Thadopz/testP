@@ -202,6 +202,49 @@ func TestDynamicRunnerRunAppliesRecordAndSavesCheckpoint(t *testing.T) {
 	}
 }
 
+func TestDynamicRunnerAppliesRecordsAsOneBatch(t *testing.T) {
+	provider := newFakeShardProvider([]clusterownership.Ownership{
+		{ShardID: 1, NodeID: 10, Epoch: 1},
+	})
+	eventLog := newDynamicTailFakeEventLog()
+	applier := newFakeBatchApplier()
+	runner := NewRunner(10, provider, eventLog, applier, nil)
+	runner.SetBatchOptions(3, time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runner.Run(ctx)
+	}()
+
+	waitForDynamicTailPositionCount(t, eventLog, 1)
+	go func() {
+		for offset := int64(0); offset < 3; offset++ {
+			eventLog.send(1, testRecord(fmt.Sprintf("event-%d", offset), 1, offset))
+		}
+	}()
+
+	select {
+	case batch := <-applier.batches:
+		if len(batch) != 3 {
+			t.Fatalf("batch size mismatch: got %d, want 3", len(batch))
+		}
+		for index, record := range batch {
+			if record.Position.Offset != int64(index) {
+				t.Fatalf("record %d offset mismatch: got %d, want %d", index, record.Position.Offset, index)
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for record batch")
+	}
+
+	cancel()
+	err := <-errCh
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error mismatch: got %v, want %v", err, context.Canceled)
+	}
+}
+
 func TestDynamicRunnerRunAddsShardAfterProviderChanges(t *testing.T) {
 	provider := newFakeShardProvider(nil)
 	eventLog := newDynamicTailFakeEventLog()
@@ -669,6 +712,28 @@ type fakeApplier struct {
 	mu     sync.Mutex
 	events []model.Event
 	err    error
+}
+
+type fakeBatchApplier struct {
+	batches chan []eventlog.Record
+}
+
+func newFakeBatchApplier() *fakeBatchApplier {
+	return &fakeBatchApplier{batches: make(chan []eventlog.Record, 1)}
+}
+
+func (f *fakeBatchApplier) Apply(ctx context.Context, event model.Event) error {
+	return nil
+}
+
+func (f *fakeBatchApplier) ApplyRecordsWithFence(
+	ctx context.Context,
+	records []eventlog.Record,
+	ownership clusterownership.Ownership,
+) error {
+	batch := append([]eventlog.Record(nil), records...)
+	f.batches <- batch
+	return nil
 }
 
 func (f *fakeApplier) Apply(ctx context.Context, event model.Event) error {

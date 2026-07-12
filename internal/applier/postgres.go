@@ -32,13 +32,21 @@ func (a *PostgresApplier) ApplyRecordWithFence(
 	record eventlog.Record,
 	currentOwnership ownership.Ownership,
 ) error {
+	return a.ApplyRecordsWithFence(ctx, []eventlog.Record{record}, currentOwnership)
+}
+
+func (a *PostgresApplier) ApplyRecordsWithFence(
+	ctx context.Context,
+	records []eventlog.Record,
+	currentOwnership ownership.Ownership,
+) error {
 	if a.pool == nil {
 		return fmt.Errorf("postgres pool is required")
 	}
-	if record.Event.ID == "" {
-		return fmt.Errorf("event id is required")
+	if err := validateRecordBatch(records, currentOwnership); err != nil {
+		return err
 	}
-	if err := a.base.checkFence(record.Event, currentOwnership); err != nil {
+	if err := a.base.checkFence(records[0].Event, currentOwnership); err != nil {
 		return err
 	}
 
@@ -49,6 +57,45 @@ func (a *PostgresApplier) ApplyRecordWithFence(
 	defer tx.Rollback(ctx)
 
 	queries := db.New(tx)
+	transactionApplier := *a.base
+	transactionStore := orderstate.NewPostgresStore(queries)
+	transactionApplier.orderStore = transactionStore
+
+	for _, record := range records {
+		if err := a.applyRecordInTransaction(ctx, queries, &transactionApplier, transactionStore, record); err != nil {
+			return err
+		}
+	}
+
+	lastRecord := records[len(records)-1]
+	if err := a.base.checkFence(lastRecord.Event, currentOwnership); err != nil {
+		return err
+	}
+	if err := queries.UpsertShardCheckpoint(ctx, db.UpsertShardCheckpointParams{
+		ConsumerName: model.ConsumerOrderWorker,
+		Topic:        model.TopicOrderEvents,
+		ShardID:      int32(lastRecord.Position.ShardID),
+		OffsetValue:  lastRecord.Position.Offset + 1,
+		Epoch:        currentOwnership.Epoch,
+		NodeID:       int32(a.nodeID),
+		UpdatedAt:    lastRecord.Event.OccurredAt,
+	}); err != nil {
+		return fmt.Errorf("save shard checkpoint: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit event transaction: %w", err)
+	}
+	return nil
+}
+
+func (a *PostgresApplier) applyRecordInTransaction(
+	ctx context.Context,
+	queries *db.Queries,
+	transactionApplier *EventApplier,
+	transactionStore *orderstate.PostgresStore,
+	record eventlog.Record,
+) error {
 	inserted, err := queries.RecordInboxEvent(ctx, db.RecordInboxEventParams{
 		ConsumerName: model.ConsumerOrderWorker,
 		EventID:      record.Event.ID,
@@ -61,9 +108,6 @@ func (a *PostgresApplier) ApplyRecordWithFence(
 	}
 
 	if inserted > 0 {
-		transactionApplier := *a.base
-		transactionStore := orderstate.NewPostgresStore(queries)
-		transactionApplier.orderStore = transactionStore
 		if err := transactionApplier.Apply(ctx, record.Event); err != nil {
 			return err
 		}
@@ -74,24 +118,23 @@ func (a *PostgresApplier) ApplyRecordWithFence(
 			}
 		}
 	}
+	return nil
+}
 
-	if err := a.base.checkFence(record.Event, currentOwnership); err != nil {
-		return err
+func validateRecordBatch(records []eventlog.Record, currentOwnership ownership.Ownership) error {
+	if len(records) == 0 {
+		return fmt.Errorf("record batch is empty")
 	}
-	if err := queries.UpsertShardCheckpoint(ctx, db.UpsertShardCheckpointParams{
-		ConsumerName: model.ConsumerOrderWorker,
-		Topic:        model.TopicOrderEvents,
-		ShardID:      int32(record.Position.ShardID),
-		OffsetValue:  record.Position.Offset + 1,
-		Epoch:        currentOwnership.Epoch,
-		NodeID:       int32(a.nodeID),
-		UpdatedAt:    record.Event.OccurredAt,
-	}); err != nil {
-		return fmt.Errorf("save shard checkpoint: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit event transaction: %w", err)
+	for index, record := range records {
+		if record.Event.ID == "" {
+			return fmt.Errorf("record %d event id is required", index)
+		}
+		if record.Position.ShardID != currentOwnership.ShardID || record.Event.ShardID != currentOwnership.ShardID {
+			return fmt.Errorf("record %d shard does not match ownership shard %d", index, currentOwnership.ShardID)
+		}
+		if index > 0 && record.Position.Offset != records[index-1].Position.Offset+1 {
+			return fmt.Errorf("record offsets are not consecutive at index %d", index)
+		}
 	}
 	return nil
 }
