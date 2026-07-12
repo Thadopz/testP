@@ -23,12 +23,10 @@ func NewMatcher(riders []*model.Rider, cellSize int, loadWeight int64) *Matcher 
 	}
 }
 
-// 已弃用
 func (m *Matcher) FindNearbyCandidates(x int, y int, radius int) []RiderCandidate {
 	return m.grid.FindNearbyCandidates(x, y, radius)
 }
 
-// 已弃用
 func (m *Matcher) FindNearbyCandidatesInRange(x int, y int, innerRadius int, outerRadius int) []RiderCandidate {
 	return m.grid.FindNearbyCandidatesInRange(x, y, innerRadius, outerRadius)
 }

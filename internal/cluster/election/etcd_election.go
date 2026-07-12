@@ -141,6 +141,7 @@ func (e *EtcdElection) putLeaderKey(ctx context.Context, leaseID clientv3.LeaseI
 	return resp.Succeeded, nil
 }
 
+// 撤销租约
 func (e *EtcdElection) revokeLease(ctx context.Context, leaseID clientv3.LeaseID) error {
 	requestCtx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
@@ -157,18 +158,18 @@ func (e *EtcdElection) watchKeepAlive(ctx context.Context, keepCancel context.Ca
 	for {
 		select {
 		case <-ctx.Done():
-			e.clearLeader(leaseID)
+			e.loseLeader(leaseID)
 			return
 		case resp, ok := <-keepCh:
 			if !ok || resp == nil {
-				e.clearLeader(leaseID)
+				e.loseLeader(leaseID)
 				return
 			}
 		}
 	}
 }
 
-func (e *EtcdElection) clearLeader(leaseID clientv3.LeaseID) {
+func (e *EtcdElection) loseLeader(leaseID clientv3.LeaseID) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 

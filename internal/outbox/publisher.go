@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
 	db "testP/internal/database"
 	"testP/internal/eventlog"
 	"testP/internal/model"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Config struct {
@@ -63,6 +64,7 @@ func (p *Publisher) Run(ctx context.Context) error {
 }
 
 func (p *Publisher) PublishOnce(ctx context.Context) (int, error) {
+	//抢占
 	events, err := p.claim(ctx)
 	if err != nil {
 		return 0, err
@@ -110,9 +112,9 @@ func (p *Publisher) publishTopic(
 ) ([]string, error) {
 	modelEvents := make([]model.Event, 0, len(items))
 	for _, item := range items {
-		modelEvents = append(modelEvents, outboxEventToModel(item))
+		modelEvents = append(modelEvents, outboxToEvent(item))
 	}
-
+	//如果实现批处理接口那就批处理，不然就一条条打进去
 	if batchTarget, ok := target.(eventlog.BatchAppender); ok {
 		if _, err := batchTarget.AppendBatch(ctx, modelEvents); err != nil {
 			for _, item := range items {
@@ -134,7 +136,7 @@ func (p *Publisher) publishTopic(
 	return publishedIDs, nil
 }
 
-func outboxEventToModel(item db.OutboxEvent) model.Event {
+func outboxToEvent(item db.OutboxEvent) model.Event {
 	return model.Event{
 		ID:            item.EventID,
 		Type:          model.EventType(item.EventType),
