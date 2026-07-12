@@ -15,6 +15,7 @@ type Querier interface {
 	GetOrderForUpdate(ctx context.Context, orderID int64) (Order, error)
 	GetRider(ctx context.Context, uid int64) (Rider, error)
 	GetShardCheckpoint(ctx context.Context, arg GetShardCheckpointParams) (ShardCheckpoint, error)
+	ListMissedOrdersForRetry(ctx context.Context, arg ListMissedOrdersForRetryParams) ([]ListMissedOrdersForRetryRow, error)
 	MarkOrderMatched(ctx context.Context, arg MarkOrderMatchedParams) (int64, error)
 	MarkOrderMissed(ctx context.Context, arg MarkOrderMissedParams) (int64, error)
 	MarkOutboxEventFailed(ctx context.Context, arg MarkOutboxEventFailedParams) error

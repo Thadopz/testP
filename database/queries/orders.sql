@@ -7,6 +7,14 @@ SELECT * FROM orders
 WHERE order_id = $1
 FOR UPDATE;
 
+-- name: ListMissedOrdersForRetry :many
+SELECT order_id, shard_id
+FROM orders
+WHERE order_id BETWEEN sqlc.arg(start_id) AND sqlc.arg(end_id)
+  AND status = 'missed'
+  AND attempt < sqlc.arg(attempt)
+ORDER BY order_id;
+
 -- name: UpsertOrder :exec
 INSERT INTO orders (
     order_id, shard_id, status, x, y, attempt,

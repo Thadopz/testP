@@ -62,6 +62,46 @@ func (q *Queries) GetOrderForUpdate(ctx context.Context, orderID int64) (Order, 
 	return i, err
 }
 
+const listMissedOrdersForRetry = `-- name: ListMissedOrdersForRetry :many
+SELECT order_id, shard_id
+FROM orders
+WHERE order_id BETWEEN $1 AND $2
+  AND status = 'missed'
+  AND attempt < $3
+ORDER BY order_id
+`
+
+type ListMissedOrdersForRetryParams struct {
+	StartID int64 `json:"start_id"`
+	EndID   int64 `json:"end_id"`
+	Attempt int32 `json:"attempt"`
+}
+
+type ListMissedOrdersForRetryRow struct {
+	OrderID int64 `json:"order_id"`
+	ShardID int32 `json:"shard_id"`
+}
+
+func (q *Queries) ListMissedOrdersForRetry(ctx context.Context, arg ListMissedOrdersForRetryParams) ([]ListMissedOrdersForRetryRow, error) {
+	rows, err := q.db.Query(ctx, listMissedOrdersForRetry, arg.StartID, arg.EndID, arg.Attempt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMissedOrdersForRetryRow{}
+	for rows.Next() {
+		var i ListMissedOrdersForRetryRow
+		if err := rows.Scan(&i.OrderID, &i.ShardID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markOrderMatched = `-- name: MarkOrderMatched :execrows
 UPDATE orders
 SET status = 'matched',
